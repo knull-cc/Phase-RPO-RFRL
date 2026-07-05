@@ -224,7 +224,9 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         trues = []
         diagnostics = {
             'baseline': [],
+            'raw_retrieval_forecast': [],
             'retrieval_forecast': [],
+            'retrieval_correction': [],
             'retrieval_enhanced': [],
             'preference_score': [],
             'fusion_weight': [],

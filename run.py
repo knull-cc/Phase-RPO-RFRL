@@ -16,8 +16,8 @@ def build_parser():
                         help='task name; TSF-Lib only supports long_term_forecast')
     parser.add_argument('--is_training', type=int, default=1, help='status: 1 train+test, 0 test only')
     parser.add_argument('--model_id', type=str, default='test', help='model id')
-    parser.add_argument('--model', type=str, default='DLinear',
-                        help='model name; any file in models/ that defines class Model (e.g. DLinear, iTransformer, PatchTST)')
+    parser.add_argument('--model', type=str, default='PhaseRPO_RFRL_MLP',
+                        help='model name; any file in models/ that defines class Model')
 
     # data loader
     parser.add_argument('--data', type=str, default='ETTh1',
@@ -54,20 +54,26 @@ def build_parser():
     parser.add_argument('--embed', type=str, default='timeF',
                         help='time features encoding, options:[timeF, fixed, learned]')
     parser.add_argument('--activation', type=str, default='gelu', help='activation')
-    parser.add_argument('--patch_len', type=int, default=16, help='patch length (PatchTST-style models)')
-    parser.add_argument('--stride', type=int, default=8, help='stride (PatchTST-style models)')
+    parser.add_argument('--patch_len', type=int, default=16, help='patch length for models that support patching')
+    parser.add_argument('--stride', type=int, default=8, help='stride for models that support patching')
     parser.add_argument('--distil', action='store_false', default=True,
                         help='whether to use distilling in encoder (used in setting name)')
     parser.add_argument('--individual', action='store_true', default=False,
-                        help='DLinear: a linear layer for each variate(channel) individually')
+                        help='channel-independent option for models that support it')
     parser.add_argument('--mlp_hidden_dim', type=int, default=512,
                         help='hidden size for MLP host backbones such as PhaseRPO_RFRL_MLP')
     parser.add_argument('--mlp_dropout', type=float, default=0.1,
                         help='dropout for MLP host backbones')
+    parser.add_argument('--mlp_use_revin', action='store_true', default=True,
+                        help='enable RevIN normalization in the PhaseRPO_RFRL_MLP host')
+    parser.add_argument('--disable_mlp_revin', action='store_false', dest='mlp_use_revin',
+                        help='disable RevIN normalization in the PhaseRPO_RFRL_MLP host')
+    parser.add_argument('--mlp_spectral_bins', type=int, default=16,
+                        help='non-zero FFT bins used by the MLP host spectral context')
     parser.add_argument('--mlp_use_layernorm', action='store_true', default=True,
-                        help='enable LayerNorm over the temporal axis in MLP host backbones')
+                        help='deprecated compatibility flag; PhaseRPO_RFRL_MLP uses RevIN instead')
     parser.add_argument('--disable_mlp_layernorm', action='store_false', dest='mlp_use_layernorm',
-                        help='disable LayerNorm in MLP host backbones')
+                        help='deprecated compatibility flag; PhaseRPO_RFRL_MLP uses RevIN instead')
 
     # Phase-RPO-RFRL arguments (used by PhaseRPO_RFRL_* models)
     parser.add_argument('--use_phase_rpo_rfrl', action='store_true', default=True,
@@ -87,6 +93,8 @@ def build_parser():
     parser.add_argument('--rpo_loss_weight', type=float, default=0.1, help='RPO preference auxiliary loss weight')
     parser.add_argument('--rfrl_loss_weight', type=float, default=0.05, help='RFRL policy auxiliary loss weight')
     parser.add_argument('--retrieval_cost', type=float, default=0.01, help='penalty for high retrieval/fusion usage')
+    parser.add_argument('--retrieval_residual_init', type=float, default=0.1,
+                        help='initial scale for retrieval residual corrections')
 
     # optimization
     parser.add_argument('--num_workers', type=int, default=10, help='data loader num workers')

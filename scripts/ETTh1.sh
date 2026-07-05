@@ -1,18 +1,36 @@
 #!/usr/bin/env bash
 # ETTh1 (7 variates, hourly). Usage: bash scripts/ETTh1.sh [--model X ...]
-model_name=${MODEL:-DLinear}
+model_name=${MODEL:-PhaseRPO_RFRL_MLP}
 extra_args="$@"
 
-if [[ "$model_name" == "DLinear" || "$model_name" == "PhaseRPO_RFRL_DLinear" ]]; then
-  seq_len=336
-  learning_rate=0.005
-elif [[ "$model_name" == "PhaseRPO_RFRL_MLP" ]]; then
-  seq_len=96
-  learning_rate=0.001
-else
-  seq_len=96
-  learning_rate=0.0001
-fi
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --model)
+      if [ "$#" -gt 1 ]; then
+        model_name="$2"
+      fi
+      shift 2
+      ;;
+    --model=*)
+      model_name="${1#--model=}"
+      shift
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+case "$model_name" in
+  PhaseRPO_RFRL_MLP)
+    seq_len=96
+    learning_rate=0.001
+    ;;
+  *)
+    seq_len=96
+    learning_rate=0.0001
+    ;;
+esac
 
 for pred_len in 96 192 336 720; do
   python -u run.py \

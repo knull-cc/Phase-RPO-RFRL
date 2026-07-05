@@ -18,33 +18,24 @@ TSF-Lib
 * 模型即插即用：在 models/ 下新增 X.py，文件中包含 class Model，即可通过 --model X 调用。
 * 自动模型加载：无需手动维护模型注册表。
 * 精简任务范围：只保留 long-term forecasting，便于集中修改和实验。
-* 内置基础模型：包含 DLinear、iTransformer、PatchTST，可作为 baseline 或改写模板。
+* 当前默认模型：`PhaseRPO_RFRL_MLP`，用于实现和测试 Phase-RPO-RFRL。
 * 提供 example：example/ 中的代码用于指导 AI 或开发者如何基于当前 base 修改模型。
 
 Phase-RPO-RFRL
 
-当前实现保留 DLinear 作为纯 baseline，但 Phase-RPO-RFRL 已不必绑定 DLinear。当前提供两种 Phase-RPO-RFRL 版本：
+当前实现只保留 `PhaseRPO_RFRL_MLP`。它不使用周期查询机制；host 的先验来自输入窗口自身的频域摘要，方法先验来自相位检索。
 
-* `PhaseRPO_RFRL_MLP`：推荐的 backbone-style 默认版本，使用两层 MLP host。
-* `PhaseRPO_RFRL_DLinear`：保留的 DLinear host 版本，用于和纯 DLinear baseline 对照。
+当前流程为：
 
-这两类模型都会在训练开始前用 train split 构建时间安全的 retrieval bank，并按：
+RevIN Residual MLP Host -> Phase-aware residual retrieval -> RPO preference -> RFRL Controller -> Adaptive Fusion
 
-Host Model -> Phase-aware Retrieval -> RPO preference -> RFRL Controller -> Adaptive Fusion
+模型会在训练开始前用 train split 构建时间安全的 retrieval bank。检索分支返回候选 future 相对候选历史末端的 residual/delta，而不是把候选绝对 future 当作完整预测。
 
-生成最终预测。运行纯 DLinear baseline：
-
-python run.py ... --model DLinear
-
-运行推荐的 MLP backbone 版本：
+运行默认模型：
 
 python run.py ... --model PhaseRPO_RFRL_MLP
 
-运行 DLinear host 版本：
-
-python run.py ... --model PhaseRPO_RFRL_DLinear
-
-常用可调参数包括 `--mlp_hidden_dim`、`--mlp_dropout`、`--phase_top_k`、`--phase_max_freqs`、`--phase_max_bank_size`、`--rpo_loss_weight`、`--rfrl_loss_weight` 和 `--retrieval_cost`。
+常用可调参数包括 `--mlp_hidden_dim`、`--mlp_dropout`、`--mlp_use_revin`、`--mlp_spectral_bins`、`--phase_top_k`、`--phase_max_freqs`、`--phase_max_bank_size`、`--rpo_loss_weight`、`--rfrl_loss_weight`、`--retrieval_residual_init` 和 `--retrieval_cost`。
 
 目录结构
 
@@ -85,26 +76,20 @@ dataset/
 
 bash scripts/ETTh1.sh
 
-切换模型：
-
-bash scripts/ETTh1.sh --model iTransformer
-bash scripts/ETTh1.sh --model PatchTST
-
 修改训练参数：
 
-bash scripts/ETTh1.sh --model iTransformer --train_epochs 5 --learning_rate 0.0005
+bash scripts/ETTh1.sh --train_epochs 20 --learning_rate 0.001
 
 一键运行多个数据集(推荐)：
 
 bash run_main.sh （最推荐）
-bash run_main.sh --model iTransformer
 
 也可以直接调用 run.py：
 
 python run.py \
   --task_name long_term_forecast --is_training 1 \
   --data ETTh1 --root_path ./dataset/ETT-small/ --data_path ETTh1.csv \
-  --model_id ETTh1_96_96 --model iTransformer \
+  --model_id ETTh1_96_96 --model PhaseRPO_RFRL_MLP \
   --features M --seq_len 96 --label_len 48 --pred_len 96 \
   --enc_in 7 --dec_in 7 --c_out 7
 

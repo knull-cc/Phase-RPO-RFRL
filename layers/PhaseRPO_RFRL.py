@@ -32,7 +32,7 @@ class PhaseAwareRetrievalBank(nn.Module):
         self.exclusion_radius = exclusion_radius or (seq_len + pred_len)
 
         self.register_buffer('memory_x', torch.empty(0), persistent=False)
-        self.register_buffer('memory_y', torch.empty(0), persistent=False)
+        self.register_buffer('memory_delta', torch.empty(0), persistent=False)
         self.register_buffer('memory_phase', torch.empty(0), persistent=False)
         self.register_buffer('memory_amplitude', torch.empty(0), persistent=False)
         self.register_buffer('memory_time', torch.empty(0), persistent=False)
@@ -43,7 +43,7 @@ class PhaseAwareRetrievalBank(nn.Module):
         return self.memory_x.numel() > 0
 
     def build(self, train_dataset, device):
-        xs, ys, indices = [], [], []
+        xs, deltas, indices = [], [], []
         n_items = len(train_dataset)
         if self.max_bank_size and n_items > self.max_bank_size:
             keep = torch.linspace(0, n_items - 1, steps=self.max_bank_size).long().unique().tolist()
@@ -57,12 +57,14 @@ class PhaseAwareRetrievalBank(nn.Module):
             else:
                 index = item_idx
                 seq_x, seq_y, _, _ = sample
-            xs.append(torch.as_tensor(seq_x, dtype=torch.float32))
-            ys.append(torch.as_tensor(seq_y[-self.pred_len:], dtype=torch.float32))
+            seq_x = torch.as_tensor(seq_x, dtype=torch.float32)
+            seq_y = torch.as_tensor(seq_y[-self.pred_len:], dtype=torch.float32)
+            xs.append(seq_x)
+            deltas.append(seq_y - seq_x[-1:, :])
             indices.append(int(index))
 
         self.memory_x = torch.stack(xs, dim=0).to(device)
-        self.memory_y = torch.stack(ys, dim=0).to(device)
+        self.memory_delta = torch.stack(deltas, dim=0).to(device)
         self.memory_indices = torch.tensor(indices, dtype=torch.long, device=device)
         self.memory_phase, self.memory_amplitude, self.memory_time = self._encode(self.memory_x)
 
@@ -90,7 +92,7 @@ class PhaseAwareRetrievalBank(nn.Module):
 
     def retrieve(self, x, batch_index=None, mode='train'):
         if not self.is_ready:
-            fallback = x[:, -1:, :].repeat(1, self.pred_len, 1)
+            fallback = torch.zeros(x.size(0), self.pred_len, x.size(2), device=x.device, dtype=x.dtype)
             diagnostics = {
                 'top_indices': None,
                 'top_similarity': torch.zeros(x.size(0), 1, device=x.device, dtype=x.dtype),
@@ -122,15 +124,15 @@ class PhaseAwareRetrievalBank(nn.Module):
         k = min(self.top_k, sim.size(1))
         top_similarity, top_indices = torch.topk(sim, k=k, dim=1)
         weights = F.softmax(top_similarity / self.temperature, dim=1)
-        candidates = self.memory_y[top_indices]
-        retrieved = torch.einsum('bk,bkpc->bpc', weights, candidates)
+        candidates = self.memory_delta[top_indices]
+        retrieved_delta = torch.einsum('bk,bkpc->bpc', weights, candidates)
         diagnostics = {
             'top_indices': top_indices,
             'top_similarity': top_similarity,
             'weights': weights,
             'phase_similarity': phase_sim.gather(1, top_indices).mean(dim=1),
         }
-        return retrieved, diagnostics
+        return retrieved_delta, diagnostics
 
 
 class RetrievalPreferenceController(nn.Module):

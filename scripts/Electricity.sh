@@ -1,7 +1,25 @@
 #!/usr/bin/env bash
 # Electricity / ECL (321 variates, hourly). Usage: bash scripts/Electricity.sh [--model X ...]
-model_name=${MODEL:-DLinear}
+model_name=${MODEL:-PhaseRPO_RFRL_MLP}
 extra_args="$@"
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --model)
+      if [ "$#" -gt 1 ]; then
+        model_name="$2"
+      fi
+      shift 2
+      ;;
+    --model=*)
+      model_name="${1#--model=}"
+      shift
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
 
 seq_len=96
 for pred_len in 96 192 336 720; do

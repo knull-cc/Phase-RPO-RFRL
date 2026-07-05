@@ -5,10 +5,104 @@ import torch.nn.functional as F
 from layers.PhaseRPO_RFRL import PhaseAwareRetrievalBank, RetrievalPreferenceController, AdaptiveFusion
 
 
+class RevIN(nn.Module):
+    def __init__(self, eps=1e-5):
+        super().__init__()
+        self.eps = eps
+
+    def normalize(self, x):
+        mean = x.mean(dim=1, keepdim=True).detach()
+        stdev = torch.sqrt(torch.var(x, dim=1, keepdim=True, unbiased=False) + self.eps).detach()
+        return (x - mean) / stdev, mean, stdev
+
+    def denormalize(self, x, mean, stdev):
+        return x * stdev + mean
+
+
+class SpectralResidualMLPHost(nn.Module):
+    """
+    Frequency-aware temporal MLP host for Phase-RPO-RFRL.
+    It uses RevIN and an input-derived spectral context only.
+    """
+
+    def __init__(self, seq_len, pred_len, hidden_dim, dropout=0.1,
+                 spectral_bins=16, use_revin=True):
+        super().__init__()
+        self.seq_len = seq_len
+        self.pred_len = pred_len
+        self.hidden_dim = hidden_dim
+        self.spectral_bins = min(max(int(spectral_bins), 0), max(seq_len // 2, 0))
+        self.use_revin = use_revin
+        self.revin = RevIN()
+
+        self.input_proj = nn.Linear(seq_len, hidden_dim)
+        if self.spectral_bins > 0:
+            self.spectral_proj = nn.Sequential(
+                nn.Linear(2 * self.spectral_bins, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+        else:
+            self.spectral_proj = None
+
+        self.temporal_mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+        )
+        self.output_proj = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, pred_len),
+        )
+        self.shortcut_head = nn.Linear(seq_len, pred_len)
+
+    def _spectral_context(self, x_cf):
+        if self.spectral_proj is None:
+            return torch.zeros(
+                x_cf.size(0), x_cf.size(1), self.hidden_dim,
+                dtype=x_cf.dtype, device=x_cf.device,
+            )
+
+        x_centered = x_cf - x_cf.mean(dim=-1, keepdim=True)
+        spectrum = torch.fft.rfft(x_centered, dim=-1)[..., 1:self.spectral_bins + 1]
+        amplitude = spectrum.abs()
+        phase_cos = spectrum.real / (amplitude + 1e-6)
+        phase_sin = spectrum.imag / (amplitude + 1e-6)
+        amp_scale = torch.log1p(amplitude)
+        amp_scale = amp_scale / (amp_scale.mean(dim=-1, keepdim=True) + 1e-6)
+        spectral_feature = torch.cat([phase_cos * amp_scale, phase_sin * amp_scale], dim=-1)
+        return self.spectral_proj(spectral_feature)
+
+    def forward(self, x, return_state=False):
+        if self.use_revin:
+            x_norm, mean, stdev = self.revin.normalize(x)
+        else:
+            x_norm = x
+            mean = torch.zeros_like(x[:, :1, :])
+            stdev = torch.ones_like(x[:, :1, :])
+
+        x_cf = x_norm.permute(0, 2, 1)
+        projected = self.input_proj(x_cf)
+        state = projected + self._spectral_context(x_cf)
+        hidden = state + self.temporal_mlp(state)
+        out_norm = self.output_proj(hidden) + self.shortcut_head(x_cf)
+        out = out_norm.permute(0, 2, 1)
+
+        if self.use_revin:
+            out = self.revin.denormalize(out, mean, stdev)
+
+        stats = {'mean': mean, 'stdev': stdev}
+        if return_state:
+            return out, hidden, stats
+        return out
+
+
 class Model(nn.Module):
     """
-    Default Phase-RPO-RFRL backbone with a two-layer MLP host.
-    This is a backbone-style version rather than a plug-and-play wrapper.
+    Phase-RPO-RFRL backbone with a frequency-aware residual MLP host.
     """
 
     def __init__(self, configs):
@@ -21,22 +115,25 @@ class Model(nn.Module):
 
         self.hidden_dim = getattr(configs, 'mlp_hidden_dim', configs.d_model)
         self.mlp_dropout = getattr(configs, 'mlp_dropout', configs.dropout)
-        self.use_host_norm = getattr(configs, 'mlp_use_layernorm', True)
+        self.use_revin = getattr(configs, 'mlp_use_revin', True)
+        self.host_spectral_bins = getattr(configs, 'mlp_spectral_bins',
+                                          getattr(configs, 'phase_max_freqs', 16))
 
-        self.input_norm = nn.LayerNorm(self.seq_len) if self.use_host_norm else nn.Identity()
-        self.host_backbone = nn.Sequential(
-            nn.Linear(self.seq_len, self.hidden_dim),
-            nn.GELU(),
-            nn.Dropout(self.mlp_dropout),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.GELU(),
+        self.host = SpectralResidualMLPHost(
+            seq_len=self.seq_len,
+            pred_len=self.pred_len,
+            hidden_dim=self.hidden_dim,
+            dropout=self.mlp_dropout,
+            spectral_bins=self.host_spectral_bins,
+            use_revin=self.use_revin,
         )
-        self.baseline_head = nn.Linear(self.hidden_dim, self.pred_len)
-        self.shortcut_head = nn.Linear(self.seq_len, self.pred_len)
 
         self.rpo_loss_weight = getattr(configs, 'rpo_loss_weight', 0.1)
         self.rfrl_loss_weight = getattr(configs, 'rfrl_loss_weight', 0.05)
         self.retrieval_cost = getattr(configs, 'retrieval_cost', 0.01)
+        self.retrieval_residual_scale = nn.Parameter(
+            torch.tensor(float(getattr(configs, 'retrieval_residual_init', 0.1)))
+        )
         self.use_phase_rpo_rfrl = getattr(configs, 'use_phase_rpo_rfrl', True)
         self.latest_aux_loss = None
         self.latest_diagnostics = {}
@@ -60,8 +157,10 @@ class Model(nn.Module):
             exclusion_radius=exclusion_radius,
         )
         self.host_to_retrieval = nn.Sequential(
-            nn.Linear(self.hidden_dim, self.pred_len),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
             nn.GELU(),
+            nn.Dropout(self.mlp_dropout),
+            nn.Linear(self.hidden_dim, self.pred_len),
         )
         self.retrieval_adapter = nn.Sequential(
             nn.Linear(self.pred_len, self.pred_len),
@@ -75,6 +174,9 @@ class Model(nn.Module):
         )
         self.adaptive_fusion = AdaptiveFusion(channels=self.channels)
 
+        nn.init.zeros_(self.retrieval_adapter[-1].weight)
+        nn.init.zeros_(self.retrieval_adapter[-1].bias)
+
     def prepare_retrieval_bank(self, train_data, device=None):
         if not self.use_phase_rpo_rfrl:
             return
@@ -82,39 +184,37 @@ class Model(nn.Module):
         print('Building Phase-RPO-RFRL retrieval bank from train split...')
         self.phase_retrieval.build(train_data, device=device)
 
-    def encode_host(self, x_enc):
-        host_input = x_enc.permute(0, 2, 1)
-        host_input = self.input_norm(host_input)
-        host_state = self.host_backbone(host_input)
-        return host_input, host_state
-
     def host_forecast(self, x_enc, return_state=False):
-        host_input, host_state = self.encode_host(x_enc)
-        baseline = self.baseline_head(host_state) + self.shortcut_head(host_input)
-        baseline = baseline.permute(0, 2, 1)
+        baseline, host_state, norm_stats = self.host(x_enc, return_state=True)
         if return_state:
-            return baseline, host_state
+            return baseline, host_state, norm_stats
         return baseline
 
     def forecast(self, x_enc):
         return self.host_forecast(x_enc)
 
     def forecast_with_retrieval(self, x_enc, batch_index=None, mode='train', target_y=None):
-        baseline, host_state = self.host_forecast(x_enc, return_state=True)
+        baseline, host_state, norm_stats = self.host_forecast(x_enc, return_state=True)
         if not self.use_phase_rpo_rfrl:
             self.latest_aux_loss = None
             self.latest_diagnostics = {'baseline': baseline.detach()}
             return baseline
 
-        raw_retrieval, retrieval_info = self.phase_retrieval.retrieve(x_enc, batch_index=batch_index, mode=mode)
-        residual = raw_retrieval - x_enc[:, -1:, :]
+        phase_delta, retrieval_info = self.phase_retrieval.retrieve(
+            x_enc, batch_index=batch_index, mode=mode
+        )
+        stdev = norm_stats['stdev'].clamp_min(1e-5)
+        phase_delta_norm = phase_delta / stdev
         host_guided_bias = self.host_to_retrieval(host_state)
-        retrieval_input = residual.permute(0, 2, 1) + host_guided_bias
-        retrieval_forecast = self.retrieval_adapter(retrieval_input).permute(0, 2, 1)
-        retrieval_forecast = retrieval_forecast + x_enc[:, -1:, :]
+        retrieval_input = phase_delta_norm.permute(0, 2, 1) + host_guided_bias
+        retrieval_correction_norm = self.retrieval_adapter(retrieval_input).permute(0, 2, 1)
+        retrieval_correction = self.retrieval_residual_scale * retrieval_correction_norm * stdev
+
+        raw_retrieval_forecast = x_enc[:, -1:, :] + phase_delta
+        retrieval_forecast = baseline + retrieval_correction
 
         preference_score, guidance = self.rfrl_controller(x_enc, baseline, retrieval_forecast, retrieval_info)
-        retrieval_enhanced = baseline + preference_score * (retrieval_forecast - baseline)
+        retrieval_enhanced = baseline + preference_score * retrieval_correction
         final, fusion_weight = self.adaptive_fusion(baseline, retrieval_enhanced, guidance)
 
         self.latest_aux_loss = None
@@ -123,11 +223,11 @@ class Model(nn.Module):
             if self.features == 'MS':
                 target = target[:, :, -1:]
                 baseline_cmp = baseline[:, :, -1:]
-                retrieval_cmp = retrieval_enhanced[:, :, -1:]
+                retrieval_cmp = retrieval_forecast[:, :, -1:]
                 final_cmp = final[:, :, -1:]
             else:
                 baseline_cmp = baseline
-                retrieval_cmp = retrieval_enhanced
+                retrieval_cmp = retrieval_forecast
                 final_cmp = final
 
             baseline_err = F.mse_loss(baseline_cmp.detach(), target, reduction='none').mean(dim=(1, 2))
@@ -148,7 +248,9 @@ class Model(nn.Module):
 
         self.latest_diagnostics = {
             'baseline': baseline.detach(),
+            'raw_retrieval_forecast': raw_retrieval_forecast.detach(),
             'retrieval_forecast': retrieval_forecast.detach(),
+            'retrieval_correction': retrieval_correction.detach(),
             'retrieval_enhanced': retrieval_enhanced.detach(),
             'preference_score': preference_score.detach(),
             'fusion_weight': fusion_weight.detach(),
