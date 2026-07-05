@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.DS_Store
+checkpoints/
+results/
+test_results/
+result_long_term_forecast.txt
+dataset/
+*.npy
+*.pdf
