@@ -51,7 +51,8 @@ def data_provider(args, flag):
         seasonal_patterns=None # We do not use this option.
     )
     print(flag, len(data_set))
-    data_set = IndexedDataset(data_set)
+    if args.model == 'PhaseRPO_RFRL_DLinear':
+        data_set = IndexedDataset(data_set)
 
     data_loader = DataLoader(
         data_set,

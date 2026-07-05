@@ -150,7 +150,7 @@ class RetrievalPreferenceController(nn.Module):
         delta = retrieval_forecast - baseline
         top_similarity = diagnostics['top_similarity']
         weights = diagnostics['weights']
-        if top_similarity is None:
+        if top_similarity is None or weights is None:
             sim_mean = torch.zeros(x.size(0), device=x.device, dtype=x.dtype)
             sim_gap = sim_mean
             entropy = sim_mean
