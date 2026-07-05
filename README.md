@@ -23,19 +23,28 @@ TSF-Lib
 
 Phase-RPO-RFRL
 
-当前实现保留 DLinear 作为纯 baseline。Phase-RPO-RFRL 使用独立模型名 `PhaseRPO_RFRL_DLinear`，不会污染 `--model DLinear` 的官方 baseline 行为。运行插件模型时，模型会在训练开始前用 train split 构建时间安全的 retrieval bank，并按：
+当前实现保留 DLinear 作为纯 baseline，但 Phase-RPO-RFRL 已不必绑定 DLinear。当前提供两种 Phase-RPO-RFRL 版本：
 
-Host DLinear -> Phase-aware Retrieval -> RPO preference -> RFRL Controller -> Adaptive Fusion
+* `PhaseRPO_RFRL_MLP`：推荐的 backbone-style 默认版本，使用两层 MLP host。
+* `PhaseRPO_RFRL_DLinear`：保留的 DLinear host 版本，用于和纯 DLinear baseline 对照。
+
+这两类模型都会在训练开始前用 train split 构建时间安全的 retrieval bank，并按：
+
+Host Model -> Phase-aware Retrieval -> RPO preference -> RFRL Controller -> Adaptive Fusion
 
 生成最终预测。运行纯 DLinear baseline：
 
 python run.py ... --model DLinear
 
-运行 Phase-RPO-RFRL：
+运行推荐的 MLP backbone 版本：
+
+python run.py ... --model PhaseRPO_RFRL_MLP
+
+运行 DLinear host 版本：
 
 python run.py ... --model PhaseRPO_RFRL_DLinear
 
-常用可调参数包括 `--phase_top_k`、`--phase_max_freqs`、`--phase_max_bank_size`、`--rpo_loss_weight`、`--rfrl_loss_weight` 和 `--retrieval_cost`。
+常用可调参数包括 `--mlp_hidden_dim`、`--mlp_dropout`、`--phase_top_k`、`--phase_max_freqs`、`--phase_max_bank_size`、`--rpo_loss_weight`、`--rfrl_loss_weight` 和 `--retrieval_cost`。
 
 目录结构
 

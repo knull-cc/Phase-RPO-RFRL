@@ -6,6 +6,9 @@ extra_args="$@"
 if [[ "$model_name" == "DLinear" || "$model_name" == "PhaseRPO_RFRL_DLinear" ]]; then
   seq_len=336
   learning_rate=0.005
+elif [[ "$model_name" == "PhaseRPO_RFRL_MLP" ]]; then
+  seq_len=96
+  learning_rate=0.001
 else
   seq_len=96
   learning_rate=0.0001
