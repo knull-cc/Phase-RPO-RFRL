@@ -61,11 +61,11 @@ def build_parser():
     parser.add_argument('--individual', action='store_true', default=False,
                         help='DLinear: a linear layer for each variate(channel) individually')
 
-    # Phase-RPO-RFRL plugin (enabled by default for DLinear)
+    # Phase-RPO-RFRL plugin arguments (used by --model PhaseRPO_RFRL_DLinear)
     parser.add_argument('--use_phase_rpo_rfrl', action='store_true', default=True,
-                        help='enable Phase-RPO-RFRL retrieval-control plugin')
+                        help='enable Phase-RPO-RFRL retrieval-control plugin for plugin models')
     parser.add_argument('--disable_phase_rpo_rfrl', action='store_false', dest='use_phase_rpo_rfrl',
-                        help='disable Phase-RPO-RFRL plugin and use plain host forecast')
+                        help='disable Phase-RPO-RFRL plugin when a plugin model supports that switch')
     parser.add_argument('--phase_top_k', type=int, default=8, help='top-k retrieval candidates')
     parser.add_argument('--phase_max_freqs', type=int, default=16, help='number of non-zero FFT bins used by phase retrieval')
     parser.add_argument('--phase_temperature', type=float, default=0.07, help='retrieval softmax temperature')

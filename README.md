@@ -23,13 +23,17 @@ TSF-Lib
 
 Phase-RPO-RFRL
 
-当前实现已将 Phase-RPO-RFRL 作为 DLinear 的默认插件路径。运行默认 DLinear 时，模型会在训练开始前用 train split 构建时间安全的 retrieval bank，并按：
+当前实现保留 DLinear 作为纯 baseline。Phase-RPO-RFRL 使用独立模型名 `PhaseRPO_RFRL_DLinear`，不会污染 `--model DLinear` 的官方 baseline 行为。运行插件模型时，模型会在训练开始前用 train split 构建时间安全的 retrieval bank，并按：
 
 Host DLinear -> Phase-aware Retrieval -> RPO preference -> RFRL Controller -> Adaptive Fusion
 
-生成最终预测。若需要退回纯 DLinear baseline，可添加：
+生成最终预测。运行纯 DLinear baseline：
 
-python run.py ... --model DLinear --disable_phase_rpo_rfrl
+python run.py ... --model DLinear
+
+运行 Phase-RPO-RFRL：
+
+python run.py ... --model PhaseRPO_RFRL_DLinear
 
 常用可调参数包括 `--phase_top_k`、`--phase_max_freqs`、`--phase_max_bank_size`、`--rpo_loss_weight`、`--rfrl_loss_weight` 和 `--retrieval_cost`。
 

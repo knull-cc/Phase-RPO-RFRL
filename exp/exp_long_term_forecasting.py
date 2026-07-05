@@ -223,6 +223,9 @@ class Exp_Long_Term_Forecast(Exp_Basic):
         preds = []
         trues = []
         diagnostics = {
+            'baseline': [],
+            'retrieval_forecast': [],
+            'retrieval_enhanced': [],
             'preference_score': [],
             'fusion_weight': [],
             'top_similarity': [],
