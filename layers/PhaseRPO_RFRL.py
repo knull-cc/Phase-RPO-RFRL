@@ -256,13 +256,21 @@ class RetrievalActionController(nn.Module):
     from a small discrete action support.
     """
 
-    def __init__(self, channels, hidden_size=64, alpha_bins=(0.0, 0.05, 0.10, 0.20, 0.40)):
+    def __init__(
+        self,
+        channels,
+        hidden_size=64,
+        alpha_bins=(0.0, 0.01, 0.02, 0.05, 0.10, 0.20, 0.40),
+        no_retrieval_bias=2.0,
+    ):
         super().__init__()
         self.channels = channels
         alpha_bins = torch.as_tensor(alpha_bins, dtype=torch.float32).clamp(0.0, 1.0)
         if alpha_bins.numel() == 0:
             alpha_bins = torch.tensor([0.0, 0.10, 0.20], dtype=torch.float32)
         alpha_bins = torch.unique(alpha_bins, sorted=True)
+        if not torch.isclose(alpha_bins[0], torch.tensor(0.0, dtype=alpha_bins.dtype)):
+            alpha_bins = torch.cat([torch.zeros(1, dtype=alpha_bins.dtype), alpha_bins]).unique(sorted=True)
         self.register_buffer('alpha_bins', alpha_bins, persistent=False)
 
         self.feature_net = nn.Sequential(
@@ -277,6 +285,10 @@ class RetrievalActionController(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_size, alpha_bins.numel()),
         )
+        with torch.no_grad():
+            final_layer = self.policy_net[-1]
+            final_layer.bias.zero_()
+            final_layer.bias[0] = float(no_retrieval_bias)
 
     @staticmethod
     def _diag_mean(diagnostics, name, x):
@@ -323,11 +335,13 @@ class RetrievalActionController(nn.Module):
         action_probabilities = F.softmax(action_logits, dim=1)
         alpha_bins = self.alpha_bins.to(device=x.device, dtype=x.dtype)
         action_alpha = torch.sum(action_probabilities * alpha_bins.view(1, -1), dim=1)
+        action_index = torch.argmax(action_probabilities, dim=1)
         return (
             preference_score,
             action_alpha.view(-1, 1, 1),
             action_probabilities,
             action_logits,
+            action_index,
         )
 
 

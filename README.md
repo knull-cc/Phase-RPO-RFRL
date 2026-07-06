@@ -24,22 +24,26 @@ TSF-Lib
 Phase-RPO-RFRL
 
 当前实现只保留 `PhaseRPO_RFRL_MLP`。它不使用周期查询机制；host 的先验来自输入窗口自身的频域摘要，检索插件采用时域相似度主召回，并把相位/幅值作为候选重排信号。
+当前主线是 risk-aware retrieval action policy：检索不是固定后处理，而是一个带 no-retrieval 动作的样本级策略决策。
 
 当前流程为：
 
-RevIN Residual MLP Host -> time-domain retrieval top-K -> phase/amplitude rerank top-M -> residual adapter -> RPO risk score -> RFRL action alpha -> Adaptive Fusion
+RevIN Residual MLP Host -> time-domain retrieval top-K -> phase/amplitude rerank top-M -> residual adapter -> counterfactual utility estimation -> RPO risk score -> RFRL action policy -> Adaptive Fusion
 
 模型会在训练开始前用 train split 构建时间安全的 retrieval bank。检索分支返回候选 future 相对候选历史末端的 residual/delta，而不是把候选绝对 future 当作完整预测。
-RPO 不直接乘到预测上，而是学习当前检索修正是否有收益的 risk/preference score；RFRL 使用该 score 作为控制特征，输出最终残差动作强度 `action_alpha`，最终形式为：
+RPO 不直接乘到预测上，而是学习当前检索修正是否有收益的 risk/preference score；RFRL 使用该 score 作为控制特征，在 `0, 0.01, 0.02, 0.05, 0.1, 0.2, 0.4` 等动作强度中学习选择。`0` 是显式 no-retrieval 动作，不是普通 gate 的边界值。
+最终形式为：
 
 final = baseline + action_alpha * retrieval_correction
+
+训练时会用真实未来构造 oracle action label：系统枚举每个候选 `action_alpha` 的 counterfactual forecast，选择误差最低且超过 gain margin 的动作作为 RFRL 监督信号。adapter 的辅助训练也只作用在 oracle 认为 retrieval 有用的样本上，学习 `oracle_alpha * retrieval_correction` 的有效残差，避免坏检索样本强行训练 correction。
 
 运行默认模型：
 
 python run.py ... --model PhaseRPO_RFRL_MLP
 
-常用可调参数包括 `--mlp_hidden_dim`、`--mlp_dropout`、`--mlp_use_revin`、`--mlp_spectral_bins`、`--retrieval_mode`、`--retrieval_top_k`、`--retrieval_top_m`、`--retrieval_time_key_len`、`--phase_max_freqs`、`--phase_similarity_weight`、`--amplitude_similarity_weight`、`--rfrl_alpha_bins`、`--rpo_loss_weight`、`--rfrl_loss_weight`、`--retrieval_adapter_loss_weight`、`--retrieval_residual_init` 和 `--retrieval_cost`。
-测试后可以用 `tools/analyze_retrieval_diagnostics.py <result_dir>` 查看 baseline、raw retrieval、adapter correction、oracle alpha、model action alpha 和相似度相关性，判断瓶颈在检索、adapter 还是 RFRL 控制器。
+常用可调参数包括 `--mlp_hidden_dim`、`--mlp_dropout`、`--mlp_use_revin`、`--mlp_spectral_bins`、`--retrieval_mode`、`--retrieval_top_k`、`--retrieval_top_m`、`--retrieval_time_key_len`、`--phase_max_freqs`、`--phase_similarity_weight`、`--amplitude_similarity_weight`、`--rfrl_alpha_bins`、`--rfrl_no_retrieval_bias`、`--rfrl_regret_loss_weight`、`--rpo_gain_margin`、`--rfrl_gain_margin`、`--rpo_loss_weight`、`--rfrl_loss_weight`、`--retrieval_adapter_loss_weight`、`--retrieval_correction_reg_weight`、`--retrieval_residual_init` 和 `--retrieval_cost`。
+测试后可以用 `tools/analyze_retrieval_diagnostics.py <result_dir>` 查看 baseline、raw retrieval、adapter correction、oracle alpha、model action alpha、policy regret、false accept、false reject、abstention accuracy 和相似度相关性，判断瓶颈在检索、adapter、RPO 风险判断还是 RFRL 动作策略。
 
 目录结构
 

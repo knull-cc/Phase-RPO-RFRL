@@ -65,6 +65,11 @@ def print_gain_rate(name, gain):
     print(f"harmful {name} rate: {(gain < 0).mean():.2%}")
 
 
+def print_slice_summary(name, mask, values):
+    if mask.any():
+        print(f"{name}: n={mask.sum()} ({mask.mean():.2%}), mean={values[mask].mean():.6f}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Analyze Phase-RPO-RFRL retrieval diagnostics.")
     parser.add_argument("result_dir", help="A results/ directory with pred.npy, true.npy and retrieval_diagnostics.npz")
@@ -130,6 +135,7 @@ def main():
         print(summarize("enhanced_gain_vs_baseline", enhanced_gain))
     if oracle_gain is not None:
         print(summarize("oracle_alpha_gain_vs_baseline", oracle_gain))
+        print(summarize("policy_regret_vs_oracle", final_mse - oracle_mse))
 
     print()
     print_gain_rate("final", final_gain)
@@ -139,15 +145,20 @@ def main():
     if oracle_gain is not None:
         print_gain_rate("oracle alpha", oracle_gain)
 
+    oracle_use = None
+    model_use = None
     if "action_alpha" in diag:
         action_alpha = sample_mean(diag["action_alpha"])
         print()
         print(summarize("action_alpha", action_alpha))
+        if "action_alpha_bins" in diag:
+            bins = diag["action_alpha_bins"][0].reshape(-1)
+            print("action_alpha_bins:", ",".join(f"{item:.4g}" for item in bins))
         if "oracle_alpha" in diag:
             oracle_alpha_mean = sample_mean(diag["oracle_alpha"])
             print(summarize("oracle_alpha", oracle_alpha_mean))
             print(summarize("abs_action_alpha_error", np.abs(action_alpha - oracle_alpha_mean)))
-            print(f"model retrieval-use rate: {(action_alpha > 1e-6).mean():.2%}")
+            print(f"expected-alpha retrieval-use rate: {(action_alpha > 1e-6).mean():.2%}")
             print(f"oracle retrieval-use rate: {(oracle_alpha_mean > 1e-6).mean():.2%}")
             maybe_corr("corr(action_alpha, oracle_alpha)", action_alpha, oracle_alpha_mean)
         maybe_corr("corr(action_alpha, final_gain)", action_alpha, final_gain)
@@ -159,6 +170,32 @@ def main():
         probs = diag["action_probabilities"]
         entropy = -(probs * np.log(probs + 1e-8)).sum(axis=1)
         print(summarize("action_probability_entropy", entropy))
+        no_retrieval_prob = probs[:, 0]
+        print(summarize("no_retrieval_probability", no_retrieval_prob))
+        maybe_corr("corr(no_retrieval_probability, final_gain)", no_retrieval_prob, final_gain)
+        maybe_corr("corr(no_retrieval_probability, adapter_gain)", no_retrieval_prob, adapter_gain)
+
+    if "action_index" in diag and "oracle_action_index" in diag:
+        action_index = diag["action_index"].reshape(-1).astype(np.int64)
+        oracle_action_index = diag["oracle_action_index"].reshape(-1).astype(np.int64)
+        model_use = action_index > 0
+        oracle_use = oracle_action_index > 0
+        print()
+        print(f"argmax action accuracy: {(action_index == oracle_action_index).mean():.2%}")
+        print(f"argmax model retrieval-use rate: {model_use.mean():.2%}")
+        print(f"argmax oracle retrieval-use rate: {oracle_use.mean():.2%}")
+        print(f"abstention decision accuracy: {(model_use == oracle_use).mean():.2%}")
+        print(f"true reject rate: {((~model_use) & (~oracle_use)).mean():.2%}")
+        print(f"false accept rate: {(model_use & (~oracle_use)).mean():.2%}")
+        print(f"false reject rate: {((~model_use) & oracle_use).mean():.2%}")
+        print_slice_summary("final_gain on oracle-use slice", oracle_use, final_gain)
+        print_slice_summary("final_gain on oracle-abstain slice", ~oracle_use, final_gain)
+        print_slice_summary("final_gain on false-accept slice", model_use & (~oracle_use), final_gain)
+        print_slice_summary("final_gain on false-reject slice", (~model_use) & oracle_use, final_gain)
+
+    if "policy_regret" in diag:
+        print()
+        print(summarize("saved_policy_regret", sample_mean(diag["policy_regret"])))
 
     if "fusion_weight" in diag and "action_alpha" not in diag:
         fusion_weight = sample_mean(diag["fusion_weight"])
@@ -169,6 +206,12 @@ def main():
         preference = sample_mean(diag["preference_score"])
         print()
         print(summarize("rpo_preference_score", preference))
+        if oracle_use is not None:
+            rpo_accept = preference >= 0.5
+            print(f"rpo accept rate: {rpo_accept.mean():.2%}")
+            print(f"rpo abstention accuracy: {(rpo_accept == oracle_use).mean():.2%}")
+            print(f"rpo false accept rate: {(rpo_accept & (~oracle_use)).mean():.2%}")
+            print(f"rpo false reject rate: {((~rpo_accept) & oracle_use).mean():.2%}")
         maybe_corr("corr(rpo_preference_score, final_gain)", preference, final_gain)
         maybe_corr("corr(rpo_preference_score, adapter_gain)", preference, adapter_gain)
         if raw_gain is not None:
@@ -192,7 +235,9 @@ def main():
                 maybe_corr(f"corr({key}, raw_retrieval_gain)", value, raw_gain)
 
     print()
-    if raw_gain is not None and raw_gain.mean() <= 0 and (
+    if oracle_gain is not None and oracle_gain.mean() > 0 and final_gain.mean() <= 0:
+        print("Likely bottleneck: retrieval action policy. Oracle actions can help, but learned actions still leave regret.")
+    elif raw_gain is not None and raw_gain.mean() <= 0 and (
         oracle_gain is None or oracle_gain.mean() <= 0
     ):
         print("Likely bottleneck: retrieval quality. Time-primary candidates still do not beat the host baseline on average.")
@@ -200,8 +245,6 @@ def main():
         oracle_gain is None or oracle_gain.mean() <= 0
     ):
         print("Likely bottleneck: retrieval adapter. Candidate residuals may exist, but the learned correction is not useful.")
-    elif oracle_gain is not None and oracle_gain.mean() > 0 and final_gain.mean() <= 0:
-        print("Likely bottleneck: RFRL action policy. Oracle alpha can help, but learned action_alpha is not using it well.")
     elif adapter_gain.mean() > 0 and final_gain.mean() <= 0:
         print("Likely bottleneck: adaptive fusion/action scaling. Adapter correction has signal, but final control degrades it.")
     elif final_gain.mean() <= 0:
@@ -212,8 +255,10 @@ def main():
     print("\nInterpretation guide:")
     print("- raw_retrieval_gain_vs_baseline <= 0: retrieved historical residuals are weak as full forecasts.")
     print("- adapter_gain_vs_baseline <= 0: adapter/correction is not yet producing useful residuals.")
-    print("- oracle_alpha_gain_vs_baseline > 0 and final_gain_vs_baseline <= 0: RFRL action learning is the bottleneck.")
-    print("- low corr(action_alpha, oracle_alpha): controller is not learning when/how strongly to use retrieval.")
+    print("- oracle_alpha_gain_vs_baseline > 0: the action space contains useful retrieval decisions.")
+    print("- policy_regret_vs_oracle > 0: learned policy leaves accuracy on the table.")
+    print("- high false accept rate: RFRL still uses retrieval when oracle would abstain.")
+    print("- high false reject rate: RFRL rejects useful retrieval corrections.")
 
 
 if __name__ == "__main__":

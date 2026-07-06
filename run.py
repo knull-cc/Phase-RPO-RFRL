@@ -104,12 +104,22 @@ def build_parser():
     parser.add_argument('--amplitude_similarity_weight', type=float, default=0.10, help='amplitude reranking weight')
     parser.add_argument('--time_similarity_weight', type=float, default=1.00, help='time-domain similarity weight')
     parser.add_argument('--rfrl_hidden_size', type=int, default=64, help='RFRL controller hidden size')
-    parser.add_argument('--rfrl_alpha_bins', type=str, default='0,0.05,0.1,0.2,0.4',
+    parser.add_argument('--rfrl_alpha_bins', type=str, default='0,0.01,0.02,0.05,0.1,0.2,0.4',
                         help='comma-separated retrieval action strengths used by RFRL')
+    parser.add_argument('--rfrl_no_retrieval_bias', type=float, default=2.0,
+                        help='initial logit bias for the no-retrieval action')
+    parser.add_argument('--rfrl_regret_loss_weight', type=float, default=0.5,
+                        help='weight for counterfactual policy-regret auxiliary loss inside RFRL')
+    parser.add_argument('--rfrl_gain_margin', type=float, default=0.0,
+                        help='minimum absolute MSE gain required before a nonzero oracle action is preferred')
+    parser.add_argument('--rpo_gain_margin', type=float, default=0.0,
+                        help='minimum absolute MSE gain for RPO to label retrieval as useful')
     parser.add_argument('--rpo_loss_weight', type=float, default=0.1, help='RPO preference auxiliary loss weight')
     parser.add_argument('--rfrl_loss_weight', type=float, default=0.05, help='RFRL policy auxiliary loss weight')
     parser.add_argument('--retrieval_adapter_loss_weight', type=float, default=0.02,
                         help='supervised residual adapter auxiliary loss weight')
+    parser.add_argument('--retrieval_correction_reg_weight', type=float, default=0.001,
+                        help='L2 regularization weight for normalized retrieval corrections')
     parser.add_argument('--retrieval_cost', type=float, default=0.01, help='penalty for high retrieval/fusion usage')
     parser.add_argument('--retrieval_residual_init', type=float, default=0.1,
                         help='initial scale for retrieval residual corrections')
