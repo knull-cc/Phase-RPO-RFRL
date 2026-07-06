@@ -150,6 +150,8 @@ def analyze_raft_topm_rpo(result_dir, pred, true, diag, final_mse, final_mae):
 
     reference_is_raft = bool(np.asarray(diag.get("rpo_reference_is_raft", [[1]])).reshape(-1).mean() >= 0.5)
     reference_name = "raft" if reference_is_raft else "baseline"
+    final_mode_value = int(round(float(np.asarray(diag.get("rpo_final_mode", [[0]])).reshape(-1).mean())))
+    final_mode = {0: "rerank", 1: "gated", 2: "reference"}.get(final_mode_value, "unknown")
     final_gain_ref_mse = reference_mse - final_mse
     final_gain_ref_mae = reference_mae - final_mae
     reranked_gain_ref_mse = reference_mse - reranked_mse
@@ -178,6 +180,7 @@ def analyze_raft_topm_rpo(result_dir, pred, true, diag, final_mse, final_mae):
 
     print()
     print(f"RPO mode: RAFT top-M utility rerank; utility reference = {reference_name}")
+    print(f"RPO final mode: {final_mode}")
     print(f"top-M candidate actions: {candidate_count}")
     print(summarize("baseline_mse", baseline_mse))
     print(summarize("baseline_mae", baseline_mae))

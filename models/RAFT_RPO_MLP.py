@@ -74,6 +74,12 @@ class Model(nn.Module):
         self.rpo_gate_loss_weight = getattr(configs, 'rpo_gate_loss_weight', 0.5)
         self.rpo_utility_loss_weight = getattr(configs, 'rpo_utility_loss_weight', 0.5)
         self.rpo_top1_loss_weight = getattr(configs, 'rpo_top1_loss_weight', 0.0)
+        self.rpo_candidate_utility_loss_weight = getattr(
+            configs, 'rpo_candidate_utility_loss_weight', 1.0
+        )
+        self.rpo_candidate_utility_scale = getattr(
+            configs, 'rpo_candidate_utility_scale', 20.0
+        )
         self.rpo_retrieval_loss_weight = getattr(configs, 'rpo_retrieval_loss_weight', 0.2)
         self.rpo_entropy_weight = getattr(configs, 'rpo_entropy_weight', 0.0)
         self.rpo_beta = getattr(configs, 'rpo_beta', 1.0)
@@ -84,6 +90,9 @@ class Model(nn.Module):
         self.rpo_gate_epsilon = getattr(configs, 'rpo_gate_epsilon', 0.0)
         self.host_anchor_loss_weight = getattr(configs, 'host_anchor_loss_weight', 0.5)
         self.rpo_hard_eval = getattr(configs, 'rpo_hard_eval', False)
+        self.rpo_final_mode = getattr(configs, 'rpo_final_mode', 'rerank')
+        if self.rpo_final_mode not in {'rerank', 'gated', 'reference'}:
+            self.rpo_final_mode = 'rerank'
         self.rpo_utility_reference = getattr(configs, 'rpo_utility_reference', 'raft')
         if self.rpo_utility_reference not in {'raft', 'baseline'}:
             self.rpo_utility_reference = 'raft'
@@ -246,7 +255,11 @@ class Model(nn.Module):
         selected_candidate = self._gather_candidate(candidate_forecasts, rpo['candidate_index'])
         hard_accept = (rpo['predicted_utility'] > self.rpo_gate_epsilon).view(-1, 1, 1)
         selected_forecast = torch.where(hard_accept, selected_candidate, reference_forecast)
-        if self.rpo_hard_eval and not self.training:
+        if self.rpo_final_mode == 'reference':
+            final = reference_forecast
+        elif self.rpo_final_mode == 'rerank':
+            final = reranked_forecast
+        elif self.rpo_hard_eval and not self.training:
             final = selected_forecast
         else:
             final = soft_final
@@ -355,6 +368,13 @@ class Model(nn.Module):
                     rpo['predicted_utility'],
                     reranked_gain_mae.detach(),
                 )
+                candidate_utility_target = (
+                    candidate_gain_mae.detach() * self.rpo_candidate_utility_scale
+                ).clamp(-5.0, 5.0)
+                candidate_utility_loss = F.smooth_l1_loss(
+                    rpo['scores'],
+                    candidate_utility_target,
+                )
                 top1_loss = F.cross_entropy(
                     rpo['policy_logits'],
                     oracle_candidate_index.detach(),
@@ -372,6 +392,7 @@ class Model(nn.Module):
                         self.rpo_pairwise_loss_weight * pair_loss
                         + self.rpo_gate_loss_weight * gate_loss
                         + self.rpo_utility_loss_weight * utility_loss
+                        + self.rpo_candidate_utility_loss_weight * candidate_utility_loss
                         + self.rpo_top1_loss_weight * top1_loss
                     )
                     - self.rpo_entropy_weight * policy_entropy
@@ -384,6 +405,7 @@ class Model(nn.Module):
                     'rpo_pair_loss': pair_loss.detach(),
                     'rpo_gate_loss': gate_loss.detach(),
                     'rpo_utility_loss': utility_loss.detach(),
+                    'rpo_candidate_utility_loss': candidate_utility_loss.detach(),
                     'rpo_top1_loss': top1_loss.detach(),
                     'host_anchor_loss': host_anchor_loss.detach(),
                     'raft_branch_loss': raft_branch_loss.detach(),
@@ -438,6 +460,12 @@ class Model(nn.Module):
             'rpo_policy_probabilities': rpo['policy_probability'].detach(),
             'rpo_reference_probabilities': rpo['reference_probability'].detach(),
             'rpo_reference_is_raft': reference_flag.detach(),
+            'rpo_final_mode': torch.full(
+                (x_enc.size(0), 1),
+                {'rerank': 0.0, 'gated': 1.0, 'reference': 2.0}[self.rpo_final_mode],
+                device=x_enc.device,
+                dtype=x_enc.dtype,
+            ),
             'rpo_candidate_residual_mean_abs': candidate_residuals.abs().mean(dim=(2, 3)).detach(),
         }
         if oracle_action_index is not None:

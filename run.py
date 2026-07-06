@@ -165,6 +165,13 @@ def build_parser():
                         help='weight of the predicted utility regression loss')
     parser.add_argument('--rpo_top1_loss_weight', type=float, default=0.0,
                         help='optional cross-entropy weight for the oracle best top-m candidate')
+    parser.add_argument('--rpo_candidate_utility_loss_weight', type=float, default=1.0,
+                        help='weight for directly regressing each RAFT top-m candidate utility')
+    parser.add_argument('--rpo_candidate_utility_scale', type=float, default=20.0,
+                        help='scale applied to candidate MAE gain targets for RPO utility scoring')
+    parser.add_argument('--rpo_final_mode', type=str, default='rerank',
+                        choices=['rerank', 'gated', 'reference'],
+                        help='forecast returned by RAFT_RPO_MLP: reranked RPO, gated RPO/reference, or pure reference')
     parser.add_argument('--rpo_utility_reference', type=str, default='raft',
                         choices=['raft', 'baseline'],
                         help='forecast used as the RPO utility fallback/reference')
