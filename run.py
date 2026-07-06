@@ -116,10 +116,14 @@ def build_parser():
                         help='minimum absolute MSE gain for RPO to label retrieval as useful')
     parser.add_argument('--rpo_loss_weight', type=float, default=0.1, help='RPO preference auxiliary loss weight')
     parser.add_argument('--rfrl_loss_weight', type=float, default=0.05, help='RFRL policy auxiliary loss weight')
+    parser.add_argument('--host_anchor_loss_weight', type=float, default=0.5,
+                        help='auxiliary baseline loss weight that keeps the host model strong')
     parser.add_argument('--retrieval_adapter_loss_weight', type=float, default=0.02,
                         help='supervised residual adapter auxiliary loss weight')
     parser.add_argument('--retrieval_correction_reg_weight', type=float, default=0.001,
                         help='L2 regularization weight for normalized retrieval corrections')
+    parser.add_argument('--retrieval_correction_clip', type=float, default=2.0,
+                        help='tanh clip value for normalized retrieval corrections; <=0 disables clipping')
     parser.add_argument('--retrieval_cost', type=float, default=0.01, help='penalty for high retrieval/fusion usage')
     parser.add_argument('--retrieval_residual_init', type=float, default=0.1,
                         help='initial scale for retrieval residual corrections')

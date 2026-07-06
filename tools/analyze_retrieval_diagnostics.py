@@ -197,6 +197,12 @@ def main():
         print()
         print(summarize("saved_policy_regret", sample_mean(diag["policy_regret"])))
 
+    if "retrieval_residual_scale" in diag:
+        print()
+        print(summarize("retrieval_residual_scale", sample_mean(diag["retrieval_residual_scale"])))
+    if "retrieval_correction_norm" in diag:
+        print(summarize("retrieval_correction_norm", sample_mean(diag["retrieval_correction_norm"])))
+
     if "fusion_weight" in diag and "action_alpha" not in diag:
         fusion_weight = sample_mean(diag["fusion_weight"])
         print()

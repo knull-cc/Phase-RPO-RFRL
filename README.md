@@ -37,12 +37,13 @@ RPO 不直接乘到预测上，而是学习当前检索修正是否有收益的 
 final = baseline + action_alpha * retrieval_correction
 
 训练时会用真实未来构造 oracle action label：系统枚举每个候选 `action_alpha` 的 counterfactual forecast，选择误差最低且超过 gain margin 的动作作为 RFRL 监督信号。adapter 的辅助训练也只作用在 oracle 认为 retrieval 有用的样本上，学习 `oracle_alpha * retrieval_correction` 的有效残差，避免坏检索样本强行训练 correction。
+为保证 host model 仍是第一预测路径，训练中额外保留 host baseline anchor loss；retrieval correction 在归一化空间中使用 tanh clip 和正则约束，避免 adapter 产生大尺度有害残差。RPO 使用 class-balanced preference loss，避免 oracle-abstain 样本被多数 accept 样本淹没。
 
 运行默认模型：
 
 python run.py ... --model PhaseRPO_RFRL_MLP
 
-常用可调参数包括 `--mlp_hidden_dim`、`--mlp_dropout`、`--mlp_use_revin`、`--mlp_spectral_bins`、`--retrieval_mode`、`--retrieval_top_k`、`--retrieval_top_m`、`--retrieval_time_key_len`、`--phase_max_freqs`、`--phase_similarity_weight`、`--amplitude_similarity_weight`、`--rfrl_alpha_bins`、`--rfrl_no_retrieval_bias`、`--rfrl_regret_loss_weight`、`--rpo_gain_margin`、`--rfrl_gain_margin`、`--rpo_loss_weight`、`--rfrl_loss_weight`、`--retrieval_adapter_loss_weight`、`--retrieval_correction_reg_weight`、`--retrieval_residual_init` 和 `--retrieval_cost`。
+常用可调参数包括 `--mlp_hidden_dim`、`--mlp_dropout`、`--mlp_use_revin`、`--mlp_spectral_bins`、`--retrieval_mode`、`--retrieval_top_k`、`--retrieval_top_m`、`--retrieval_time_key_len`、`--phase_max_freqs`、`--phase_similarity_weight`、`--amplitude_similarity_weight`、`--rfrl_alpha_bins`、`--rfrl_no_retrieval_bias`、`--rfrl_regret_loss_weight`、`--rpo_gain_margin`、`--rfrl_gain_margin`、`--rpo_loss_weight`、`--rfrl_loss_weight`、`--host_anchor_loss_weight`、`--retrieval_adapter_loss_weight`、`--retrieval_correction_reg_weight`、`--retrieval_correction_clip`、`--retrieval_residual_init` 和 `--retrieval_cost`。
 测试后可以用 `tools/analyze_retrieval_diagnostics.py <result_dir>` 查看 baseline、raw retrieval、adapter correction、oracle alpha、model action alpha、policy regret、false accept、false reject、abstention accuracy 和相似度相关性，判断瓶颈在检索、adapter、RPO 风险判断还是 RFRL 动作策略。
 
 目录结构

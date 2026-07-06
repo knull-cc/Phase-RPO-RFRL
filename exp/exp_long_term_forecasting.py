@@ -243,6 +243,7 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             'retrieval_err': [],
             'final_err': [],
             'retrieval_residual_scale': [],
+            'retrieval_correction_norm': [],
             'fusion_weight': [],
             'top_similarity': [],
             'primary_top_similarity': [],

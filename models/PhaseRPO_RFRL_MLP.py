@@ -146,8 +146,10 @@ class Model(nn.Module):
         self.rpo_loss_weight = getattr(configs, 'rpo_loss_weight', 0.1)
         self.rfrl_loss_weight = getattr(configs, 'rfrl_loss_weight', 0.05)
         self.rfrl_regret_loss_weight = getattr(configs, 'rfrl_regret_loss_weight', 0.5)
+        self.host_anchor_loss_weight = getattr(configs, 'host_anchor_loss_weight', 0.5)
         self.retrieval_adapter_loss_weight = getattr(configs, 'retrieval_adapter_loss_weight', 0.02)
         self.retrieval_correction_reg_weight = getattr(configs, 'retrieval_correction_reg_weight', 0.001)
+        self.retrieval_correction_clip = getattr(configs, 'retrieval_correction_clip', 2.0)
         self.retrieval_cost = getattr(configs, 'retrieval_cost', 0.01)
         self.rpo_gain_margin = getattr(configs, 'rpo_gain_margin', 0.0)
         self.rfrl_gain_margin = getattr(configs, 'rfrl_gain_margin', 0.0)
@@ -254,7 +256,12 @@ class Model(nn.Module):
         host_guided_bias = self.host_to_retrieval(host_state)
         retrieval_input = retrieved_delta_norm.permute(0, 2, 1) + host_guided_bias
         retrieval_correction_norm = self.retrieval_adapter(retrieval_input).permute(0, 2, 1)
-        retrieval_correction = self.retrieval_residual_scale * retrieval_correction_norm * stdev
+        if self.retrieval_correction_clip > 0:
+            retrieval_correction_norm = self.retrieval_correction_clip * torch.tanh(
+                retrieval_correction_norm / self.retrieval_correction_clip
+            )
+        retrieval_scale = self.retrieval_residual_scale.clamp(0.0, 1.0)
+        retrieval_correction = retrieval_scale * retrieval_correction_norm * stdev
 
         raw_retrieval_forecast = x_enc[:, -1:, :] + retrieved_delta
         retrieval_forecast = baseline + retrieval_correction
@@ -318,11 +325,29 @@ class Model(nn.Module):
                 rpo_target = (oracle_gain > self.rpo_gain_margin).to(preference_score.dtype)
 
             if self.training:
+                rpo_target_detached = rpo_target.detach()
+                pos_rate = rpo_target_detached.mean().clamp(1e-3, 1.0 - 1e-3)
+                rpo_weight = torch.where(
+                    rpo_target_detached > 0,
+                    0.5 / pos_rate,
+                    0.5 / (1.0 - pos_rate),
+                )
                 preference_loss = F.binary_cross_entropy(
                     preference_score.view(-1).clamp(1e-5, 1.0 - 1e-5),
-                    rpo_target.detach(),
+                    rpo_target_detached,
+                    weight=rpo_weight,
                 )
-                policy_loss = F.cross_entropy(action_logits, oracle_index.detach())
+                action_counts = torch.bincount(
+                    oracle_index.detach(),
+                    minlength=self.rfrl_controller.alpha_bins.numel(),
+                ).to(action_logits.dtype)
+                action_weight = action_counts.sum() / action_counts.clamp_min(1.0)
+                action_weight = action_weight / action_weight.mean().clamp_min(1e-6)
+                policy_loss = F.cross_entropy(
+                    action_logits,
+                    oracle_index.detach(),
+                    weight=action_weight.to(action_logits.device),
+                )
                 expected_policy_err = torch.sum(
                     action_probabilities * alpha_err.transpose(0, 1).detach(),
                     dim=1,
@@ -345,7 +370,10 @@ class Model(nn.Module):
                     device=x_enc.device, dtype=action_probabilities.dtype
                 )
                 cost_loss = torch.sum(action_probabilities * alpha_bins_for_cost.view(1, -1), dim=1).mean()
+                host_anchor_loss = F.mse_loss(baseline_cmp, target)
                 self.latest_aux_loss = (
+                    self.host_anchor_loss_weight * host_anchor_loss
+                    +
                     self.rpo_loss_weight * preference_loss
                     + self.rfrl_loss_weight * (
                         policy_loss
@@ -363,6 +391,7 @@ class Model(nn.Module):
                     'adapter_loss': adapter_loss.detach(),
                     'correction_reg_loss': correction_reg_loss.detach(),
                     'retrieval_cost_loss': cost_loss.detach(),
+                    'host_anchor_loss': host_anchor_loss.detach(),
                     'baseline_err': baseline_err.mean().detach(),
                     'retrieval_err': retrieval_err.mean().detach(),
                     'final_err': final_err.mean().detach(),
@@ -391,7 +420,8 @@ class Model(nn.Module):
             'top_indices': retrieval_info['top_indices'],
             'primary_top_indices': retrieval_info['primary_top_indices'],
             'host_state_norm': host_state.detach().norm(dim=-1).mean(dim=-1),
-            'retrieval_residual_scale': self.retrieval_residual_scale.detach().view(1, 1).repeat(x_enc.size(0), 1),
+            'retrieval_residual_scale': retrieval_scale.detach().view(1, 1).repeat(x_enc.size(0), 1),
+            'retrieval_correction_norm': retrieval_correction_norm.detach().abs().mean(dim=(1, 2)),
         }
         if oracle_alpha is not None:
             self.latest_diagnostics['oracle_alpha'] = oracle_alpha.detach()
