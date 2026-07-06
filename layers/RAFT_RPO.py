@@ -18,7 +18,9 @@ class RAFTRetrievalBank(nn.Module):
 
     It stores train split lookback/future pairs, decomposes them with the same
     periodic averaging used by RAFT, and returns top-m soft retrieved future
-    residuals for each period.
+    residuals for each period.  The individual top-m candidates are preserved
+    in diagnostics so RPO can learn forecast-utility-aware reranking instead of
+    scoring only the already-aggregated RAFT branch.
     """
 
     def __init__(
@@ -146,6 +148,10 @@ class RAFTRetrievalBank(nn.Module):
             'primary_top_similarity': zeros,
             'weights': torch.ones_like(zeros),
             'period_similarity': zeros.squeeze(-1),
+            'candidate_y_mg': torch.zeros(
+                bsz, self.n_period, 1, self.pred_len, self.channels,
+                device=x.device, dtype=x.dtype,
+            ),
         }
 
     def retrieve(self, x, batch_index=None, mode='train'):
@@ -173,10 +179,12 @@ class RAFTRetrievalBank(nn.Module):
 
         weights = F.softmax(top_similarity / max(self.temperature, 1e-6), dim=2)
         retrieved = []
+        candidate_y_mg = []
         for period_id in range(g_num):
             indices = top_indices[period_id].reshape(-1)
             candidates = self.memory_y_mg[period_id].index_select(0, indices)
             candidates = candidates.reshape(bsz, topm, self.pred_len, self.channels)
+            candidate_y_mg.append(candidates)
             cur = torch.einsum('bm,bmpc->bpc', weights[period_id], candidates)
             retrieved.append(cur)
 
@@ -188,28 +196,42 @@ class RAFTRetrievalBank(nn.Module):
             'primary_top_similarity': top_similarity.permute(1, 0, 2).contiguous(),
             'weights': weights.permute(1, 0, 2).contiguous(),
             'period_similarity': top_similarity.mean(dim=2).transpose(0, 1).contiguous(),
+            'candidate_y_mg': torch.stack(candidate_y_mg, dim=1).contiguous(),
         }
         return period_retrieval, diagnostics
 
 
-class RPOActionScorer(nn.Module):
+class RPOCandidateScorer(nn.Module):
     """
-    Utility-grounded RPO scorer over one no-retrieval action and RAFT candidates.
+    Forecast-utility-aware scorer over the RAFT top-m retrieval candidates.
+
+    RAFT similarity remains the reference policy.  RPO only learns an additive
+    score inside the recalled candidate set:
+
+        pi_ref    = softmax(sim_RAFT / tau_ref)
+        pi_theta  = softmax((sim_RAFT + alpha * s_theta) / tau)
+
+    A separate utility head predicts whether the reranked candidate mixture
+    should be used or whether the model should fall back to the RAFT reference
+    forecast.
     """
 
     def __init__(
         self,
-        channels,
-        period_num,
         hidden_size=64,
-        no_retrieval_bias=1.0,
-        softmax_temperature=1.0,
+        reference_temperature=0.1,
+        policy_temperature=1.0,
+        score_alpha=1.0,
+        gate_temperature=0.05,
+        gate_epsilon=0.0,
     ):
         super().__init__()
-        self.channels = channels
-        self.period_num = list(period_num)
-        self.action_count = 2 + len(self.period_num)
-        self.softmax_temperature = max(float(softmax_temperature), 1e-6)
+        self.reference_temperature = max(float(reference_temperature), 1e-6)
+        self.policy_temperature = max(float(policy_temperature), 1e-6)
+        self.score_alpha = float(score_alpha)
+        self.gate_temperature = max(float(gate_temperature), 1e-6)
+        self.gate_epsilon = float(gate_epsilon)
+
         self.scorer = nn.Sequential(
             nn.Linear(12, hidden_size),
             nn.GELU(),
@@ -217,85 +239,121 @@ class RPOActionScorer(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_size, 1),
         )
-        self.action_bias = nn.Parameter(torch.zeros(self.action_count))
-        with torch.no_grad():
-            self.action_bias[0] = float(no_retrieval_bias)
+        self.utility_head = nn.Sequential(
+            nn.Linear(10, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, 1),
+        )
 
-    def _similarity_features(self, x, retrieval_info):
-        bsz = x.size(0)
-        device = x.device
-        dtype = x.dtype
-        top_similarity = retrieval_info.get('top_similarity')
-        weights = retrieval_info.get('weights')
-        if top_similarity is None or weights is None:
-            sim_mean = torch.zeros(bsz, len(self.period_num), device=device, dtype=dtype)
-            sim_gap = torch.zeros_like(sim_mean)
-            entropy = torch.zeros_like(sim_mean)
-        else:
-            top_similarity = top_similarity.to(device=device, dtype=dtype)
-            weights = weights.to(device=device, dtype=dtype)
-            sim_mean = top_similarity.mean(dim=2)
-            if top_similarity.size(2) > 1:
-                sim_gap = top_similarity[:, :, 0] - top_similarity[:, :, -1]
-            else:
-                sim_gap = torch.zeros_like(sim_mean)
-            entropy = -(weights * (weights + 1e-8).log()).sum(dim=2)
-
-        fused_mean = sim_mean.mean(dim=1, keepdim=True)
-        fused_gap = sim_gap.mean(dim=1, keepdim=True)
-        fused_entropy = entropy.mean(dim=1, keepdim=True)
-        zeros = torch.zeros(bsz, 1, device=device, dtype=dtype)
-        sim_mean = torch.cat([zeros, fused_mean, sim_mean], dim=1)
-        sim_gap = torch.cat([zeros, fused_gap, sim_gap], dim=1)
-        entropy = torch.cat([zeros, fused_entropy, entropy], dim=1)
-        return sim_mean, sim_gap, entropy
-
-    def _action_codes(self, x):
-        values = [0.0, 1.0]
-        scale = max(max(self.period_num), 1)
-        values.extend([period / scale for period in self.period_num])
-        return torch.tensor(values, device=x.device, dtype=x.dtype).view(1, -1)
-
-    def features(self, x, baseline, candidates, retrieval_info):
-        actions = torch.cat([baseline.unsqueeze(1), candidates], dim=1)
-        delta = actions - baseline.unsqueeze(1)
-        sim_mean, sim_gap, entropy = self._similarity_features(x, retrieval_info)
-
-        bsz, action_count = actions.shape[:2]
-        x_mean = x.mean(dim=(1, 2), keepdim=True).view(bsz, 1).repeat(1, action_count)
-        x_std = x.std(dim=(1, 2), unbiased=False, keepdim=True).view(bsz, 1).repeat(1, action_count)
+    def _candidate_features(
+        self,
+        x,
+        reference,
+        candidates,
+        similarity,
+        reference_probability,
+        candidate_period,
+        candidate_rank,
+    ):
+        bsz, candidate_count = candidates.shape[:2]
+        x_mean = x.mean(dim=(1, 2), keepdim=True).view(bsz, 1).repeat(1, candidate_count)
+        x_std = x.std(dim=(1, 2), unbiased=False, keepdim=True).view(bsz, 1).repeat(1, candidate_count)
         if x.size(1) > 1:
-            slope = (x[:, -1, :] - x[:, 0, :]).abs().mean(dim=1, keepdim=True).repeat(1, action_count)
+            slope = (x[:, -1, :] - x[:, 0, :]).abs().mean(dim=1, keepdim=True).repeat(1, candidate_count)
         else:
             slope = torch.zeros_like(x_mean)
-        baseline_std = baseline.std(dim=(1, 2), unbiased=False, keepdim=True).view(bsz, 1).repeat(1, action_count)
-        action_std = actions.std(dim=(2, 3), unbiased=False)
+
+        reference_std = reference.std(dim=(1, 2), unbiased=False, keepdim=True).view(bsz, 1)
+        reference_std = reference_std.repeat(1, candidate_count)
+        candidate_std = candidates.std(dim=(2, 3), unbiased=False)
+
+        delta = candidates - reference.unsqueeze(1)
         delta_abs = delta.abs().mean(dim=(2, 3))
         delta_std = delta.std(dim=(2, 3), unbiased=False)
-        no_retrieval = torch.zeros(bsz, action_count, device=x.device, dtype=x.dtype)
-        no_retrieval[:, 0] = 1.0
-        retrieval_flag = 1.0 - no_retrieval
-        action_code = self._action_codes(x).repeat(bsz, 1)
+        delta_mean = delta.mean(dim=(2, 3))
+
+        max_period = candidate_period.max().clamp_min(1.0)
+        period_code = candidate_period / max_period
+        max_rank = candidate_rank.max().clamp_min(1.0)
+        rank_code = candidate_rank / max_rank
 
         return torch.stack([
             x_mean,
             x_std,
             slope,
-            baseline_std,
-            action_std,
+            reference_std,
+            candidate_std,
             delta_abs,
             delta_std,
-            sim_mean,
-            sim_gap,
-            entropy,
-            no_retrieval,
-            retrieval_flag * action_code,
+            delta_mean,
+            similarity,
+            reference_probability,
+            rank_code,
+            period_code,
         ], dim=2)
 
-    def forward(self, x, baseline, candidates, retrieval_info):
-        features = self.features(x, baseline, candidates, retrieval_info)
-        logits = self.scorer(features).squeeze(-1) + self.action_bias.view(1, -1)
-        probabilities = F.softmax(logits / self.softmax_temperature, dim=1)
-        action_index = torch.argmax(probabilities, dim=1)
-        accept_probability = 1.0 - probabilities[:, :1]
-        return accept_probability.view(-1, 1, 1), probabilities, logits, action_index
+    def forward(self, x, reference, candidates, similarity, candidate_period, candidate_rank):
+        similarity = similarity.to(dtype=x.dtype, device=x.device)
+        candidate_period = candidate_period.to(dtype=x.dtype, device=x.device)
+        candidate_rank = candidate_rank.to(dtype=x.dtype, device=x.device)
+
+        reference_log_probability = F.log_softmax(
+            similarity / self.reference_temperature,
+            dim=1,
+        )
+        reference_probability = reference_log_probability.exp()
+
+        features = self._candidate_features(
+            x,
+            reference,
+            candidates,
+            similarity,
+            reference_probability,
+            candidate_period,
+            candidate_rank,
+        )
+        scores = self.scorer(features).squeeze(-1)
+        policy_logits = (similarity + self.score_alpha * scores) / self.policy_temperature
+        policy_log_probability = F.log_softmax(policy_logits, dim=1)
+        policy_probability = policy_log_probability.exp()
+
+        delta = candidates - reference.unsqueeze(1)
+        delta_abs = delta.abs().mean(dim=(2, 3))
+        policy_entropy = -(
+            policy_probability * (policy_log_probability)
+        ).sum(dim=1)
+        reference_entropy = -(
+            reference_probability * reference_log_probability
+        ).sum(dim=1)
+
+        utility_features = torch.stack([
+            scores.max(dim=1).values,
+            scores.mean(dim=1),
+            scores.std(dim=1, unbiased=False),
+            similarity.max(dim=1).values,
+            similarity.mean(dim=1),
+            reference_probability.max(dim=1).values,
+            policy_entropy,
+            reference_entropy,
+            delta_abs.max(dim=1).values,
+            delta_abs.mean(dim=1),
+        ], dim=1)
+        predicted_utility = self.utility_head(utility_features).squeeze(-1)
+        gate_logit = (predicted_utility - self.gate_epsilon) / self.gate_temperature
+        accept_probability = torch.sigmoid(gate_logit).view(-1, 1, 1)
+        action_index = torch.argmax(policy_probability, dim=1)
+
+        return {
+            'scores': scores,
+            'policy_logits': policy_logits,
+            'policy_probability': policy_probability,
+            'policy_log_probability': policy_log_probability,
+            'reference_probability': reference_probability,
+            'reference_log_probability': reference_log_probability,
+            'predicted_utility': predicted_utility,
+            'gate_logit': gate_logit,
+            'accept_probability': accept_probability,
+            'candidate_index': action_index,
+        }

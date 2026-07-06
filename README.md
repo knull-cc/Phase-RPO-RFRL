@@ -48,19 +48,29 @@ python run.py ... --model PhaseRPO_RFRL_MLP
 
 RAFT-RPO
 
-当前还提供 `RAFT_RPO_MLP`，用于验证“先退化到 RAFT 检索，再只加 RPO”的路线。它参考 `example/RAFT - 原始版本/` 的核心检索方式：训练开始前用 train split 构建 lookback/future 记忆库，对输入窗口做多周期平均分解，在每个周期粒度上用相关性检索 top-m 历史窗口，并 soft 聚合对应 future residual。
+当前还提供 `RAFT_RPO_MLP`，用于验证“先退化到 RAFT 检索，再只加 RPO”的路线。它参考 `example/RAFT - 原始版本/` 的核心检索方式：训练开始前用 train split 构建 lookback/future 记忆库，对输入窗口做多周期平均分解，在每个周期粒度上用相关性检索 top-m 历史窗口。和原始 RAFT 一样，代码仍保留 soft top-m 聚合后的 always-retrieve forecast 作为 reference；不同的是，新的 RAFT-RPO 还会保留每一个 top-m 历史候选 `r` 的 future residual，不再在检索阶段丢掉单候选身份。
 
-在 RAFT-RPO 中，RPO 不是 RFRL，也不是相位 gate。每个样本的候选动作是：
+在新的 RAFT-RPO 中，RPO 不是 RFRL，也不是相位 gate。RAFT 负责 recall，RPO 只在 RAFT 召回的 `G * topm` 个候选内部学习 rerank/gate：
 
-* `0=baseline`：只使用 host 线性预测。
-* `1=raft_fused`：使用 RAFT 的多周期检索融合预测。
-* `2..G+1=period_g*`：分别使用某个 RAFT 周期粒度的检索预测。
+* `reference`：默认是原始 RAFT always-retrieve forecast，也可以通过 `--rpo_utility_reference baseline` 改成 host baseline。
+* `candidate_r`：某个 RAFT period/rank 的历史候选 future residual，替换该 period 的 soft 聚合残差后，经 RAFT fusion head 生成 per-candidate forecast。
 
-训练时用真实未来值计算每个动作的 MSE，把误差最低且超过 `--rpo_gain_margin` 的动作作为 oracle preferred action；如果没有检索动作优于 baseline，则 oracle action 为 `baseline`。RPO scorer 根据当前输入、候选预测差异、检索相似度、top-m 权重熵等特征输出动作概率，最终默认使用 soft expected action 生成预测：
+训练时用真实未来值计算每个候选的 forecast utility，默认以 MAE 为偏好目标：
 
-final = sum_a p(a | x, candidates) * forecast_a
+utility(q, r) = MAE(reference(q), y) - MAE(RAFT(q, r), y)
 
-因此判断 RPO 是否有效时，不只看 final MSE，还要看它是否优于 `raft_always_retrieval_mse`，以及 false accept / false reject 是否下降。
+然后在同一个 query 的 top-M 内构造 `r+ / r-` 偏好对，满足 `MAE(r-) - MAE(r+) > --rpo_pair_margin` 的候选对才进入 reference-anchored RPO/DPO loss：
+
+log pi_ref(r | q) = log softmax(sim_RAFT(q, r) / tau_ref)
+log pi_theta(r | q) = log softmax((sim_RAFT(q, r) + alpha * s_theta(q, r)) / tau)
+L_RPO = -log sigmoid(beta * [(log pi_theta(r+) - log pi_theta(r-)) - (log pi_ref(r+) - log pi_ref(r-))])
+
+最终 forecast 不是直接替换 RAFT，而是先得到 reranked candidate mixture，再由 predicted utility gate 决定是否回退：
+
+reranked = sum_r pi_theta(r | q) * RAFT(q, r)
+final = p_accept * reranked + (1 - p_accept) * reference
+
+如果 `--rpo_hard_eval` 打开，测试时会使用硬决策：`predicted_utility <= --rpo_gate_epsilon` 则回退到 reference，否则选择 `argmax pi_theta` 的候选。
 
 运行示例：
 
@@ -76,7 +86,20 @@ python run.py \
 
 python tools/analyze_retrieval_diagnostics.py results/<result_dir>
 
-RAFT-RPO 日志会额外输出 `raft_always_gain_vs_baseline`、`oracle_action_gain_vs_baseline`、`final_gain_vs_baseline`、`policy_regret_vs_oracle`、RPO action set、每个候选动作的 MSE/gain/probability/oracle rate、argmax action accuracy、abstention decision accuracy、false accept rate、false reject rate，以及相似度与 gain 的相关性。
+RAFT-RPO 新日志会额外输出：
+
+* reference/候选上界：`raft_always_retrieval_mse/mae`、`rpo_reranked_mse/mae`、`oracle_topm_rerank_mse/mae`。
+* RPO 是否有用：`rpo_reranked_gain_vs_reference_mae`、`final_gain_vs_reference_mae`、`oracle_topm_gain_vs_reference_mae`、`rpo_gain_capture_vs_oracle_topm_mae`。
+* rerank 质量：`pi_ref_entropy`、`pi_theta_entropy`、`kl(pi_theta || pi_ref)`、`RPO top1 equals oracle best candidate`、`RPO top1 differs from RAFT-sim top1`。
+* gate 质量：`rpo_predicted_utility`、`rpo_accept_probability`、`false accept rate`、`false reject rate`、oracle-use/oracle-fallback 分片 gain。
+* 检索瓶颈定位：period-level/rank-level candidate utility，以及 similarity/score 与 best candidate gain 的相关性。
+
+判断逻辑：
+
+* `oracle_topm_gain_vs_reference_mae <= 0`：RAFT top-M 里没有足够好的候选，RPO 学不到有效 rerank。
+* `oracle_topm_gain_vs_reference_mae > 0` 但 `rpo_reranked_gain_vs_reference_mae <= 0`：top-M 有上界，RPO scorer/pairwise objective 没学到。
+* `rpo_reranked_gain_vs_reference_mae > 0` 但 `final_gain_vs_reference_mae <= 0`：rerank 有收益，但 utility gate 错收/错拒。
+* `final_gain_vs_reference_mae > 0`：RPO 相对 RAFT/reference 起到作用。
 
 目录结构
 

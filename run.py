@@ -113,7 +113,7 @@ def build_parser():
     parser.add_argument('--rfrl_gain_margin', type=float, default=0.0,
                         help='minimum absolute MSE gain required before a nonzero oracle action is preferred')
     parser.add_argument('--rpo_gain_margin', type=float, default=0.0,
-                        help='minimum absolute MSE gain for RPO to label retrieval as useful')
+                        help='minimum utility gain for RPO to label retrieval/rerank as useful; RAFT-RPO uses MAE')
     parser.add_argument('--rpo_loss_weight', type=float, default=0.1, help='RPO preference auxiliary loss weight')
     parser.add_argument('--rfrl_loss_weight', type=float, default=0.05, help='RFRL policy auxiliary loss weight')
     parser.add_argument('--host_anchor_loss_weight', type=float, default=0.5,
@@ -140,13 +140,36 @@ def build_parser():
     parser.add_argument('--raft_exclusion_radius', type=int, default=0,
                         help='train-time retrieval exclusion radius; 0 uses seq_len + pred_len')
     parser.add_argument('--rpo_hidden_size', type=int, default=64,
-                        help='hidden size for the RAFT-RPO action scorer')
+                        help='hidden size for the RAFT-RPO candidate utility scorer')
     parser.add_argument('--rpo_no_retrieval_bias', type=float, default=1.0,
-                        help='initial action-logit bias for the no-retrieval action in RAFT-RPO')
+                        help='legacy compatibility option for older RAFT-RPO action scorer runs')
     parser.add_argument('--rpo_softmax_temperature', type=float, default=1.0,
-                        help='temperature for RAFT-RPO action probabilities')
-    parser.add_argument('--rpo_pairwise_loss_weight', type=float, default=0.2,
-                        help='weight of retrieval-vs-baseline pairwise preference loss inside RAFT-RPO')
+                        help='legacy alias for --rpo_policy_temperature')
+    parser.add_argument('--rpo_reference_temperature', type=float, default=None,
+                        help='temperature for the RAFT similarity reference policy; None uses --raft_temperature')
+    parser.add_argument('--rpo_policy_temperature', type=float, default=None,
+                        help='temperature for the RPO reranked top-m candidate policy; None uses --rpo_softmax_temperature')
+    parser.add_argument('--rpo_score_alpha', type=float, default=1.0,
+                        help='scale of learned utility score added to RAFT similarity before reranking')
+    parser.add_argument('--rpo_beta', type=float, default=1.0,
+                        help='inverse temperature for reference-anchored pairwise RPO/DPO loss')
+    parser.add_argument('--rpo_pair_margin', type=float, default=None,
+                        help='minimum MAE gap for constructing r+/r- preference pairs; None uses --rpo_gain_margin')
+    parser.add_argument('--rpo_gate_temperature', type=float, default=0.05,
+                        help='temperature for converting predicted utility into fallback/rerank gate probability')
+    parser.add_argument('--rpo_gate_epsilon', type=float, default=0.0,
+                        help='predicted utility threshold; <= epsilon falls back to the reference forecast')
+    parser.add_argument('--rpo_gate_loss_weight', type=float, default=0.5,
+                        help='weight of the RPO fallback/gate classification loss')
+    parser.add_argument('--rpo_utility_loss_weight', type=float, default=0.5,
+                        help='weight of the predicted utility regression loss')
+    parser.add_argument('--rpo_top1_loss_weight', type=float, default=0.0,
+                        help='optional cross-entropy weight for the oracle best top-m candidate')
+    parser.add_argument('--rpo_utility_reference', type=str, default='raft',
+                        choices=['raft', 'baseline'],
+                        help='forecast used as the RPO utility fallback/reference')
+    parser.add_argument('--rpo_pairwise_loss_weight', type=float, default=1.0,
+                        help='weight of reference-anchored top-m candidate pairwise RPO loss')
     parser.add_argument('--rpo_retrieval_loss_weight', type=float, default=0.2,
                         help='auxiliary loss weight for the always-retrieve RAFT branch')
     parser.add_argument('--rpo_entropy_weight', type=float, default=0.0,

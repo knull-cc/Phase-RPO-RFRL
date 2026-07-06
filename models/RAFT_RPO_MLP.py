@@ -2,17 +2,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from layers.RAFT_RPO import RAFTRetrievalBank, RPOActionScorer
+from layers.RAFT_RPO import RAFTRetrievalBank, RPOCandidateScorer
 
 
 class Model(nn.Module):
     """
-    RAFT retrieval with utility-grounded Retrieval Preference Optimization.
+    RAFT retrieval with forecast-utility-aware Retrieval Preference Optimization.
 
-    Actions:
-    0. no retrieval: use the host linear forecast
-    1. RAFT fused retrieval forecast
-    2..G+1. one forecast per RAFT periodic retrieval branch
+    RAFT remains the recall/reference module:
+    - the original RAFT soft top-m aggregation is kept as the always-retrieve
+      reference forecast;
+    - RPO only reranks the individual RAFT top-m candidates and predicts whether
+      that reranked forecast should replace the reference forecast.
     """
 
     def __init__(self, configs):
@@ -45,20 +46,47 @@ class Model(nn.Module):
         ])
         self.linear_pred = nn.Linear(2 * self.pred_len, self.pred_len)
 
-        self.rpo_controller = RPOActionScorer(
-            channels=self.channels,
-            period_num=self.period_num,
-            hidden_size=getattr(configs, 'rpo_hidden_size', 64),
-            no_retrieval_bias=getattr(configs, 'rpo_no_retrieval_bias', 1.0),
-            softmax_temperature=getattr(configs, 'rpo_softmax_temperature', 1.0),
+        reference_temperature = getattr(
+            configs,
+            'rpo_reference_temperature',
+            getattr(configs, 'raft_temperature', 0.1),
         )
+        if reference_temperature is None:
+            reference_temperature = getattr(configs, 'raft_temperature', 0.1)
+        policy_temperature = getattr(
+            configs,
+            'rpo_policy_temperature',
+            None,
+        )
+        if policy_temperature is None:
+            policy_temperature = getattr(configs, 'rpo_softmax_temperature', 1.0)
+        self.rpo_controller = RPOCandidateScorer(
+            hidden_size=getattr(configs, 'rpo_hidden_size', 64),
+            reference_temperature=reference_temperature,
+            policy_temperature=policy_temperature,
+            score_alpha=getattr(configs, 'rpo_score_alpha', 1.0),
+            gate_temperature=getattr(configs, 'rpo_gate_temperature', 0.05),
+            gate_epsilon=getattr(configs, 'rpo_gate_epsilon', 0.0),
+        )
+
         self.rpo_loss_weight = getattr(configs, 'rpo_loss_weight', 0.1)
-        self.rpo_pairwise_loss_weight = getattr(configs, 'rpo_pairwise_loss_weight', 0.2)
+        self.rpo_pairwise_loss_weight = getattr(configs, 'rpo_pairwise_loss_weight', 1.0)
+        self.rpo_gate_loss_weight = getattr(configs, 'rpo_gate_loss_weight', 0.5)
+        self.rpo_utility_loss_weight = getattr(configs, 'rpo_utility_loss_weight', 0.5)
+        self.rpo_top1_loss_weight = getattr(configs, 'rpo_top1_loss_weight', 0.0)
         self.rpo_retrieval_loss_weight = getattr(configs, 'rpo_retrieval_loss_weight', 0.2)
         self.rpo_entropy_weight = getattr(configs, 'rpo_entropy_weight', 0.0)
+        self.rpo_beta = getattr(configs, 'rpo_beta', 1.0)
         self.rpo_gain_margin = getattr(configs, 'rpo_gain_margin', 0.0)
+        self.rpo_pair_margin = getattr(configs, 'rpo_pair_margin', self.rpo_gain_margin)
+        if self.rpo_pair_margin is None:
+            self.rpo_pair_margin = self.rpo_gain_margin
+        self.rpo_gate_epsilon = getattr(configs, 'rpo_gate_epsilon', 0.0)
         self.host_anchor_loss_weight = getattr(configs, 'host_anchor_loss_weight', 0.5)
         self.rpo_hard_eval = getattr(configs, 'rpo_hard_eval', False)
+        self.rpo_utility_reference = getattr(configs, 'rpo_utility_reference', 'raft')
+        if self.rpo_utility_reference not in {'raft', 'baseline'}:
+            self.rpo_utility_reference = 'raft'
 
         self.latest_aux_loss = None
         self.latest_aux_details = {}
@@ -91,187 +119,356 @@ class Model(nn.Module):
         period_forecasts = period_residuals + x_offset.unsqueeze(1)
         return period_residuals, period_forecasts
 
-    def _comparison_tensors(self, target_y, baseline, all_actions, final):
-        target = target_y[:, -self.pred_len:, :]
-        if self.features == 'MS':
-            return (
-                target[:, :, -1:],
-                baseline[:, :, -1:],
-                all_actions[:, :, :, -1:],
-                final[:, :, -1:],
+    def _candidate_period_rank(self, retrieval_info):
+        top_similarity = retrieval_info['top_similarity']
+        bsz, g_num, topm = top_similarity.shape
+        device = top_similarity.device
+        period = torch.tensor(self.period_num, device=device, dtype=top_similarity.dtype)
+        period = period.view(1, g_num, 1).expand(bsz, g_num, topm)
+        rank = torch.arange(topm, device=device, dtype=top_similarity.dtype)
+        rank = rank.view(1, 1, topm).expand(bsz, g_num, topm)
+        return period.reshape(bsz, -1), rank.reshape(bsz, -1)
+
+    def _individual_candidate_forecasts(
+        self,
+        candidate_y_mg,
+        period_residuals,
+        retrieval_sum,
+        baseline_residual,
+        x_offset,
+    ):
+        bsz, _, topm, _, _ = candidate_y_mg.shape
+        forecasts = []
+        residuals = []
+        for i, period in enumerate(self.period_num):
+            candidates = candidate_y_mg[:, i]
+            flat = candidates.reshape(bsz * topm, self.pred_len, self.channels)
+            compressed = flat.reshape(bsz * topm, self.pred_len // period, period, self.channels)
+            compressed = compressed[:, :, 0, :]
+            candidate_residual = self.retrieval_pred[i](
+                compressed.permute(0, 2, 1)
+            ).permute(0, 2, 1).reshape(bsz, topm, self.pred_len, self.channels)
+
+            context_residual = (
+                retrieval_sum.unsqueeze(1)
+                - period_residuals[:, i:i + 1]
+                + candidate_residual
             )
-        return target, baseline, all_actions, final
+            baseline_context = baseline_residual.unsqueeze(1).expand(-1, topm, -1, -1)
+            fused_input = torch.cat([baseline_context, context_residual], dim=2)
+            fused_input = fused_input.reshape(bsz * topm, 2 * self.pred_len, self.channels)
+            fused_residual = self.linear_pred(
+                fused_input.permute(0, 2, 1)
+            ).permute(0, 2, 1).reshape(bsz, topm, self.pred_len, self.channels)
+
+            residuals.append(candidate_residual)
+            forecasts.append(fused_residual + x_offset.unsqueeze(1))
+        return torch.cat(forecasts, dim=1), torch.cat(residuals, dim=1)
+
+    def _select_feature(self, value):
+        if self.features == 'MS':
+            return value[..., -1:]
+        return value
 
     @staticmethod
-    def _gather_action(actions, index):
-        bsz = actions.size(0)
-        view_shape = [bsz] + [1] * (actions.ndim - 2)
-        gather_index = index.view(*view_shape).expand(-1, *actions.shape[2:])
-        return actions.gather(1, gather_index.unsqueeze(1)).squeeze(1)
+    def _gather_candidate(candidates, index):
+        bsz = candidates.size(0)
+        gather_index = index.view(bsz, 1, 1, 1).expand(-1, 1, *candidates.shape[2:])
+        return candidates.gather(1, gather_index).squeeze(1)
 
-    @staticmethod
-    def _balanced_action_weight(action_index, action_count, dtype, device):
-        counts = torch.bincount(action_index, minlength=action_count).to(device=device, dtype=dtype)
-        weights = counts.sum() / counts.clamp_min(1.0)
-        return weights / weights.mean().clamp_min(1e-6)
+    def _reference_forecast(self, baseline, raft_forecast):
+        if self.rpo_utility_reference == 'baseline':
+            return baseline
+        return raft_forecast
+
+    def _binary_preference_loss(self, gate_logit, target):
+        target = target.to(gate_logit.dtype)
+        pos_rate = target.mean().clamp(1e-3, 1.0 - 1e-3)
+        weight = torch.where(target > 0, 0.5 / pos_rate, 0.5 / (1.0 - pos_rate))
+        return F.binary_cross_entropy_with_logits(gate_logit, target, weight=weight)
+
+    def _dpo_pair_loss(self, candidate_mae, policy_log_probability, reference_log_probability):
+        better_than = candidate_mae.unsqueeze(2) + self.rpo_pair_margin
+        worse_than = candidate_mae.unsqueeze(1)
+        pair_mask = better_than < worse_than
+        if not pair_mask.any():
+            return policy_log_probability.sum() * 0.0, pair_mask
+
+        policy_delta = policy_log_probability.unsqueeze(2) - policy_log_probability.unsqueeze(1)
+        reference_delta = reference_log_probability.unsqueeze(2) - reference_log_probability.unsqueeze(1)
+        logits = self.rpo_beta * (policy_delta - reference_delta)
+        return -F.logsigmoid(logits[pair_mask]).mean(), pair_mask
 
     def forecast_with_retrieval(self, x_enc, batch_index=None, mode='train', target_y=None):
         baseline, baseline_residual, x_offset = self.host_forecast(x_enc)
         period_retrieval, retrieval_info = self.retrieval_bank.retrieve(
             x_enc, batch_index=batch_index, mode=mode
         )
-        period_residuals, period_forecasts = self._period_candidates(period_retrieval, x_offset)
+        period_residuals, _ = self._period_candidates(period_retrieval, x_offset)
         retrieval_sum = period_residuals.sum(dim=1)
         raft_residual = self.linear_pred(
             torch.cat([baseline_residual, retrieval_sum], dim=1).permute(0, 2, 1)
         ).permute(0, 2, 1)
         raft_forecast = raft_residual + x_offset
+        reference_forecast = self._reference_forecast(baseline, raft_forecast)
 
-        candidates = torch.cat([raft_forecast.unsqueeze(1), period_forecasts], dim=1)
-        preference_score, action_probabilities, action_logits, action_index = self.rpo_controller(
-            x_enc, baseline, candidates, retrieval_info
+        candidate_forecasts, candidate_residuals = self._individual_candidate_forecasts(
+            retrieval_info['candidate_y_mg'],
+            period_residuals,
+            retrieval_sum,
+            baseline_residual,
+            x_offset,
         )
-        all_actions = torch.cat([baseline.unsqueeze(1), candidates], dim=1)
-        expected_final = torch.einsum('ba,bapc->bpc', action_probabilities, all_actions)
-        selected_forecast = self._gather_action(all_actions, action_index)
+        candidate_similarity = retrieval_info['top_similarity'].reshape(x_enc.size(0), -1)
+        candidate_period, candidate_rank = self._candidate_period_rank(retrieval_info)
+
+        rpo = self.rpo_controller(
+            x_enc,
+            reference_forecast,
+            candidate_forecasts,
+            candidate_similarity,
+            candidate_period,
+            candidate_rank,
+        )
+        reranked_forecast = torch.einsum(
+            'bk,bkpc->bpc',
+            rpo['policy_probability'],
+            candidate_forecasts,
+        )
+        accept_probability = rpo['accept_probability']
+        soft_final = (
+            accept_probability * reranked_forecast
+            + (1.0 - accept_probability) * reference_forecast
+        )
+        selected_candidate = self._gather_candidate(candidate_forecasts, rpo['candidate_index'])
+        hard_accept = (rpo['predicted_utility'] > self.rpo_gate_epsilon).view(-1, 1, 1)
+        selected_forecast = torch.where(hard_accept, selected_candidate, reference_forecast)
         if self.rpo_hard_eval and not self.training:
             final = selected_forecast
         else:
-            final = expected_final
+            final = soft_final
 
-        retrieval_probability = action_probabilities[:, 1:].sum(dim=1, keepdim=True).clamp_min(1e-6)
-        conditional_retrieval = torch.einsum(
-            'bk,bkpc->bpc',
-            action_probabilities[:, 1:] / retrieval_probability,
-            candidates,
+        action_probabilities = torch.cat([
+            1.0 - accept_probability.view(-1, 1),
+            accept_probability.view(-1, 1) * rpo['policy_probability'],
+        ], dim=1)
+        action_index = torch.where(
+            hard_accept.view(-1),
+            rpo['candidate_index'] + 1,
+            torch.zeros_like(rpo['candidate_index']),
         )
 
         self.latest_aux_loss = None
         self.latest_aux_details = {}
-        oracle_index = None
-        oracle_gain = None
-        policy_regret = None
-        baseline_err = None
-        retrieval_err = None
-        final_err = None
-        oracle_err = None
-        action_err = None
-        action_gain = None
-        best_retrieval_gain = None
+
+        oracle_action_index = None
+        oracle_candidate_index = None
         oracle_forecast = None
+        oracle_gain_mse = None
+        oracle_gain_mae = None
+        policy_regret = None
+        pair_mask = None
+        candidate_mse = None
+        candidate_mae = None
+        candidate_gain_mse = None
+        candidate_gain_mae = None
+        reference_mse = None
+        reference_mae = None
+        baseline_mse = None
+        baseline_mae = None
+        raft_mse = None
+        raft_mae = None
+        final_mse = None
+        final_mae = None
+        reranked_mse = None
+        reranked_mae = None
+        oracle_mse = None
+        oracle_mae = None
+        best_candidate_mse = None
+        best_candidate_mae = None
 
         if target_y is not None:
-            target, baseline_cmp, all_actions_cmp, final_cmp = self._comparison_tensors(
-                target_y, baseline, all_actions, final
-            )
-            action_err = ((all_actions_cmp - target.unsqueeze(1)) ** 2).mean(dim=(2, 3))
-            baseline_err = action_err[:, 0]
-            retrieval_err = action_err[:, 1]
-            final_err = F.mse_loss(final_cmp, target, reduction='none').mean(dim=(1, 2))
-            action_gain = baseline_err.unsqueeze(1) - action_err
+            target = self._select_feature(target_y[:, -self.pred_len:, :])
+            baseline_cmp = self._select_feature(baseline)
+            raft_cmp = self._select_feature(raft_forecast)
+            reference_cmp = self._select_feature(reference_forecast)
+            candidate_cmp = self._select_feature(candidate_forecasts)
+            final_cmp = self._select_feature(final)
+            reranked_cmp = self._select_feature(reranked_forecast)
 
-            with torch.no_grad():
-                action_score = action_gain.detach().clone()
-                action_score[:, 1:] = action_score[:, 1:] - self.rpo_gain_margin
-                action_score[:, 0] = 0.0
-                oracle_index = torch.argmax(action_score, dim=1)
-                oracle_err = action_err.detach().gather(1, oracle_index.view(-1, 1)).view(-1)
-                oracle_gain = baseline_err.detach() - oracle_err
-                policy_regret = final_err.detach() - oracle_err
-                best_retrieval_gain = action_gain.detach()[:, 1:].max(dim=1).values
-                oracle_forecast = self._gather_action(all_actions.detach(), oracle_index)
+            candidate_mse = ((candidate_cmp - target.unsqueeze(1)) ** 2).mean(dim=(2, 3))
+            candidate_mae = (candidate_cmp - target.unsqueeze(1)).abs().mean(dim=(2, 3))
+            reference_mse = ((reference_cmp - target) ** 2).mean(dim=(1, 2))
+            reference_mae = (reference_cmp - target).abs().mean(dim=(1, 2))
+            baseline_mse = ((baseline_cmp - target) ** 2).mean(dim=(1, 2))
+            baseline_mae = (baseline_cmp - target).abs().mean(dim=(1, 2))
+            raft_mse = ((raft_cmp - target) ** 2).mean(dim=(1, 2))
+            raft_mae = (raft_cmp - target).abs().mean(dim=(1, 2))
+            final_mse = ((final_cmp - target) ** 2).mean(dim=(1, 2))
+            final_mae = (final_cmp - target).abs().mean(dim=(1, 2))
+            reranked_mse = ((reranked_cmp - target) ** 2).mean(dim=(1, 2))
+            reranked_mae = (reranked_cmp - target).abs().mean(dim=(1, 2))
+
+            candidate_gain_mse = reference_mse.unsqueeze(1) - candidate_mse
+            candidate_gain_mae = reference_mae.unsqueeze(1) - candidate_mae
+            best_candidate_mae, oracle_candidate_index = candidate_mae.min(dim=1)
+            best_candidate_mse = candidate_mse.gather(1, oracle_candidate_index.view(-1, 1)).view(-1)
+            oracle_gain_mae = reference_mae - best_candidate_mae
+            oracle_gain_mse = reference_mse - best_candidate_mse
+            oracle_use = oracle_gain_mae > self.rpo_gain_margin
+            oracle_action_index = torch.where(
+                oracle_use,
+                oracle_candidate_index + 1,
+                torch.zeros_like(oracle_candidate_index),
+            )
+            oracle_candidate_forecast = self._gather_candidate(
+                candidate_forecasts.detach(),
+                oracle_candidate_index,
+            )
+            oracle_forecast = torch.where(
+                oracle_use.view(-1, 1, 1),
+                oracle_candidate_forecast,
+                reference_forecast.detach(),
+            )
+            oracle_cmp = self._select_feature(oracle_forecast)
+            oracle_mse = ((oracle_cmp - target) ** 2).mean(dim=(1, 2))
+            oracle_mae = (oracle_cmp - target).abs().mean(dim=(1, 2))
+            policy_regret = final_mse.detach() - oracle_mse.detach()
 
             if self.training:
-                action_weight = self._balanced_action_weight(
-                    oracle_index.detach(),
-                    all_actions.size(1),
-                    action_logits.dtype,
-                    action_logits.device,
+                pair_loss, pair_mask = self._dpo_pair_loss(
+                    candidate_mae.detach(),
+                    rpo['policy_log_probability'],
+                    rpo['reference_log_probability'],
                 )
-                policy_loss = F.cross_entropy(
-                    action_logits,
-                    oracle_index.detach(),
-                    weight=action_weight,
+                gate_target = oracle_use.detach().to(rpo['gate_logit'].dtype)
+                gate_loss = self._binary_preference_loss(rpo['gate_logit'], gate_target)
+                utility_loss = F.smooth_l1_loss(
+                    rpo['predicted_utility'],
+                    oracle_gain_mae.detach(),
                 )
-
-                retrieval_preferred = (
-                    action_gain.detach()[:, 1:] > self.rpo_gain_margin
-                ).to(action_logits.dtype)
-                pair_logits = action_logits[:, 1:] - action_logits[:, :1]
-                pos_rate = retrieval_preferred.mean().clamp(1e-3, 1.0 - 1e-3)
-                pair_weight = torch.where(
-                    retrieval_preferred > 0,
-                    0.5 / pos_rate,
-                    0.5 / (1.0 - pos_rate),
+                top1_loss = F.cross_entropy(
+                    rpo['policy_logits'],
+                    oracle_candidate_index.detach(),
                 )
-                pairwise_loss = F.binary_cross_entropy_with_logits(
-                    pair_logits,
-                    retrieval_preferred,
-                    weight=pair_weight,
-                )
-                always_retrieval_loss = action_err[:, 1].mean()
                 host_anchor_loss = F.mse_loss(baseline_cmp, target)
-                entropy = -(
-                    action_probabilities * (action_probabilities + 1e-8).log()
+                raft_branch_loss = F.mse_loss(raft_cmp, target)
+                policy_entropy = -(
+                    rpo['policy_probability'] * rpo['policy_log_probability']
                 ).sum(dim=1).mean()
+
                 self.latest_aux_loss = (
                     self.host_anchor_loss_weight * host_anchor_loss
+                    + self.rpo_retrieval_loss_weight * raft_branch_loss
                     + self.rpo_loss_weight * (
-                        policy_loss + self.rpo_pairwise_loss_weight * pairwise_loss
+                        self.rpo_pairwise_loss_weight * pair_loss
+                        + self.rpo_gate_loss_weight * gate_loss
+                        + self.rpo_utility_loss_weight * utility_loss
+                        + self.rpo_top1_loss_weight * top1_loss
                     )
-                    + self.rpo_retrieval_loss_weight * always_retrieval_loss
-                    - self.rpo_entropy_weight * entropy
+                    - self.rpo_entropy_weight * policy_entropy
+                )
+                pair_count = (
+                    pair_mask.float().sum(dim=(1, 2)).mean().detach()
+                    if pair_mask is not None else torch.zeros((), device=x_enc.device)
                 )
                 self.latest_aux_details = {
-                    'rpo_policy_loss': policy_loss.detach(),
-                    'rpo_pairwise_loss': pairwise_loss.detach(),
-                    'rpo_retrieval_loss': always_retrieval_loss.detach(),
+                    'rpo_pair_loss': pair_loss.detach(),
+                    'rpo_gate_loss': gate_loss.detach(),
+                    'rpo_utility_loss': utility_loss.detach(),
+                    'rpo_top1_loss': top1_loss.detach(),
                     'host_anchor_loss': host_anchor_loss.detach(),
-                    'rpo_entropy': entropy.detach(),
-                    'baseline_err': baseline_err.mean().detach(),
-                    'retrieval_err': retrieval_err.mean().detach(),
-                    'final_err': final_err.mean().detach(),
+                    'raft_branch_loss': raft_branch_loss.detach(),
+                    'rpo_policy_entropy': policy_entropy.detach(),
+                    'rpo_pair_count': pair_count,
+                    'reference_mae': reference_mae.mean().detach(),
+                    'oracle_gain_mae': oracle_gain_mae.mean().detach(),
+                    'final_mae': final_mae.mean().detach(),
                 }
 
-        action_names = torch.tensor(
-            [0, 1] + self.period_num,
-            dtype=x_enc.dtype,
+        diag_baseline = self._select_feature(baseline).detach()
+        diag_raft = self._select_feature(raft_forecast).detach()
+        diag_reference = self._select_feature(reference_forecast).detach()
+        diag_reranked = self._select_feature(reranked_forecast).detach()
+        diag_final = self._select_feature(final).detach()
+        diag_selected = self._select_feature(selected_forecast).detach()
+        reference_is_raft = 1.0 if self.rpo_utility_reference == 'raft' else 0.0
+        reference_flag = torch.full(
+            (x_enc.size(0), 1),
+            reference_is_raft,
             device=x_enc.device,
-        ).view(1, -1).repeat(x_enc.size(0), 1)
+            dtype=x_enc.dtype,
+        )
         self.latest_diagnostics = {
-            'baseline': baseline.detach(),
-            'raw_retrieval_forecast': raft_forecast.detach(),
-            'retrieval_forecast': conditional_retrieval.detach(),
-            'retrieval_enhanced': final.detach(),
-            'rpo_selected_forecast': selected_forecast.detach(),
-            'preference_score': preference_score.detach(),
-            'rpo_accept_probability': preference_score.detach().view(-1, 1),
+            'baseline': diag_baseline,
+            'raw_retrieval_forecast': diag_raft,
+            'rpo_reference_forecast': diag_reference,
+            'retrieval_forecast': diag_reranked,
+            'rpo_reranked_forecast': diag_reranked,
+            'retrieval_enhanced': diag_final,
+            'rpo_selected_forecast': diag_selected,
+            'preference_score': rpo['predicted_utility'].detach().view(-1, 1),
+            'rpo_predicted_utility': rpo['predicted_utility'].detach().view(-1, 1),
+            'rpo_accept_probability': accept_probability.detach().view(-1, 1),
             'action_probabilities': action_probabilities.detach(),
             'rpo_action_probabilities': action_probabilities.detach(),
             'action_index': action_index.detach(),
-            'no_retrieval_probability': action_probabilities[:, :1].detach(),
-            'fusion_weight': preference_score.detach(),
+            'no_retrieval_probability': (1.0 - accept_probability.view(-1, 1)).detach(),
+            'fusion_weight': accept_probability.detach().view(-1, 1),
             'top_similarity': retrieval_info['top_similarity'].detach(),
             'primary_top_similarity': retrieval_info['primary_top_similarity'].detach(),
             'period_similarity': retrieval_info['period_similarity'].detach(),
             'top_indices': retrieval_info['top_indices'].detach(),
             'primary_top_indices': retrieval_info['primary_top_indices'].detach(),
             'retrieval_weights': retrieval_info['weights'].detach(),
-            'rpo_action_names': action_names.detach(),
+            'rpo_candidate_similarity': candidate_similarity.detach(),
+            'rpo_candidate_period': candidate_period.detach(),
+            'rpo_candidate_rank': candidate_rank.detach(),
+            'rpo_candidate_indices': retrieval_info['top_indices'].reshape(x_enc.size(0), -1).detach(),
+            'rpo_candidate_scores': rpo['scores'].detach(),
+            'rpo_policy_probabilities': rpo['policy_probability'].detach(),
+            'rpo_reference_probabilities': rpo['reference_probability'].detach(),
+            'rpo_reference_is_raft': reference_flag.detach(),
+            'rpo_candidate_residual_mean_abs': candidate_residuals.abs().mean(dim=(2, 3)).detach(),
         }
-        if oracle_index is not None:
+        if oracle_action_index is not None:
+            rpo_action_names = torch.cat([
+                torch.zeros(x_enc.size(0), 1, device=x_enc.device, dtype=x_enc.dtype),
+                candidate_period.to(dtype=x_enc.dtype),
+            ], dim=1)
+            pair_count_per_sample = (
+                pair_mask.float().sum(dim=(1, 2))
+                if pair_mask is not None
+                else torch.zeros(x_enc.size(0), device=x_enc.device, dtype=x_enc.dtype)
+            )
             self.latest_diagnostics.update({
-                'oracle_action_index': oracle_index.detach(),
-                'oracle_gain': oracle_gain.detach(),
+                'rpo_action_names': rpo_action_names.detach(),
+                'oracle_action_index': oracle_action_index.detach(),
+                'oracle_candidate_index': oracle_candidate_index.detach(),
+                'oracle_gain': oracle_gain_mse.detach(),
+                'oracle_gain_mae': oracle_gain_mae.detach(),
                 'policy_regret': policy_regret.detach(),
-                'baseline_err': baseline_err.detach(),
-                'retrieval_err': retrieval_err.detach(),
-                'final_err': final_err.detach(),
-                'oracle_err': oracle_err.detach(),
-                'rpo_candidate_mse': action_err.detach(),
-                'rpo_candidate_gain': action_gain.detach(),
-                'rpo_best_retrieval_gain': best_retrieval_gain.detach(),
-                'rpo_oracle_forecast': oracle_forecast.detach(),
+                'baseline_err': baseline_mse.detach(),
+                'baseline_mae_err': baseline_mae.detach(),
+                'reference_err': reference_mse.detach(),
+                'reference_mae_err': reference_mae.detach(),
+                'retrieval_err': raft_mse.detach(),
+                'retrieval_mae_err': raft_mae.detach(),
+                'reranked_err': reranked_mse.detach(),
+                'reranked_mae_err': reranked_mae.detach(),
+                'final_err': final_mse.detach(),
+                'final_mae_err': final_mae.detach(),
+                'oracle_err': oracle_mse.detach(),
+                'oracle_mae_err': oracle_mae.detach(),
+                'rpo_candidate_mse': candidate_mse.detach(),
+                'rpo_candidate_mae': candidate_mae.detach(),
+                'rpo_candidate_gain': candidate_gain_mse.detach(),
+                'rpo_candidate_gain_mae': candidate_gain_mae.detach(),
+                'rpo_best_candidate_mse': best_candidate_mse.detach(),
+                'rpo_best_candidate_mae': best_candidate_mae.detach(),
+                'rpo_best_candidate_gain_mae': oracle_gain_mae.detach(),
+                'rpo_pair_count': pair_count_per_sample.detach(),
+                'rpo_oracle_forecast': self._select_feature(oracle_forecast).detach(),
             })
         return final
 

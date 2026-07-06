@@ -22,6 +22,14 @@ def summarize(name, values):
     )
 
 
+def summarize_finite(name, values):
+    values = np.asarray(values)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return f"{name}: n=0"
+    return summarize(name, values)
+
+
 def maybe_corr(name, left, right):
     left = np.asarray(left)
     right = np.asarray(right)
@@ -65,6 +73,11 @@ def print_gain_rate(name, gain):
     print(f"harmful {name} rate: {(gain < 0).mean():.2%}")
 
 
+def print_gain_rate_vs(name, comparator, gain):
+    print(f"{name} better than {comparator}: {(gain > 0).mean():.2%}")
+    print(f"harmful {name} vs {comparator} rate: {(gain < 0).mean():.2%}")
+
+
 def print_slice_summary(name, mask, values):
     if mask.any():
         print(f"{name}: n={mask.sum()} ({mask.mean():.2%}), mean={values[mask].mean():.6f}")
@@ -83,6 +96,235 @@ def action_labels(diag, action_count):
         else:
             labels.append(f"period_g{int(round(float(values[idx])))}")
     return labels
+
+
+def analyze_raft_topm_rpo(result_dir, pred, true, diag, final_mse, final_mae):
+    required = [
+        "baseline",
+        "rpo_reference_forecast",
+        "rpo_reranked_forecast",
+        "rpo_candidate_mae",
+        "rpo_candidate_mse",
+        "rpo_policy_probabilities",
+        "rpo_reference_probabilities",
+        "rpo_candidate_similarity",
+    ]
+    missing = [key for key in required if key not in diag]
+    if missing:
+        print("\nThis RAFT top-M RPO run is missing diagnostics:", ", ".join(missing))
+        return
+
+    baseline = maybe_get_prediction(diag, "baseline", pred)
+    reference = maybe_get_prediction(diag, "rpo_reference_forecast", pred)
+    raft = maybe_get_prediction(diag, "raw_retrieval_forecast", pred)
+    reranked = maybe_get_prediction(diag, "rpo_reranked_forecast", pred)
+    selected = maybe_get_prediction(diag, "rpo_selected_forecast", pred)
+    oracle = maybe_get_prediction(diag, "rpo_oracle_forecast", pred)
+
+    baseline_mse = mse(baseline, true)
+    baseline_mae = mae(baseline, true)
+    reference_mse = mse(reference, true)
+    reference_mae = mae(reference, true)
+    raft_mse = mse(raft, true) if raft is not None else reference_mse
+    raft_mae = mae(raft, true) if raft is not None else reference_mae
+    reranked_mse = mse(reranked, true)
+    reranked_mae = mae(reranked, true)
+    selected_mse = mse(selected, true) if selected is not None else None
+    selected_mae = mae(selected, true) if selected is not None else None
+    oracle_mse = mse(oracle, true) if oracle is not None else None
+    oracle_mae = mae(oracle, true) if oracle is not None else None
+
+    candidate_mse = np.asarray(diag["rpo_candidate_mse"])
+    candidate_mae = np.asarray(diag["rpo_candidate_mae"])
+    if candidate_mse.ndim != 2:
+        candidate_mse = candidate_mse.reshape(candidate_mse.shape[0], -1)
+    if candidate_mae.ndim != 2:
+        candidate_mae = candidate_mae.reshape(candidate_mae.shape[0], -1)
+    candidate_count = candidate_mae.shape[1]
+    policy_prob = np.asarray(diag["rpo_policy_probabilities"]).reshape(candidate_mae.shape)
+    reference_prob = np.asarray(diag["rpo_reference_probabilities"]).reshape(candidate_mae.shape)
+    candidate_similarity = np.asarray(diag["rpo_candidate_similarity"]).reshape(candidate_mae.shape)
+    candidate_period = np.asarray(diag.get("rpo_candidate_period", np.zeros_like(candidate_mae))).reshape(candidate_mae.shape)
+    candidate_rank = np.asarray(diag.get("rpo_candidate_rank", np.zeros_like(candidate_mae))).reshape(candidate_mae.shape)
+    candidate_scores = np.asarray(diag.get("rpo_candidate_scores", np.zeros_like(candidate_mae))).reshape(candidate_mae.shape)
+
+    reference_is_raft = bool(np.asarray(diag.get("rpo_reference_is_raft", [[1]])).reshape(-1).mean() >= 0.5)
+    reference_name = "raft" if reference_is_raft else "baseline"
+    final_gain_ref_mse = reference_mse - final_mse
+    final_gain_ref_mae = reference_mae - final_mae
+    reranked_gain_ref_mse = reference_mse - reranked_mse
+    reranked_gain_ref_mae = reference_mae - reranked_mae
+    raft_gain_baseline_mse = baseline_mse - raft_mse
+    raft_gain_baseline_mae = baseline_mae - raft_mae
+    candidate_gain_ref_mae = reference_mae[:, None] - candidate_mae
+    candidate_gain_ref_mse = reference_mse[:, None] - candidate_mse
+    best_candidate_gain_mae = candidate_gain_ref_mae.max(axis=1)
+    best_candidate_gain_mse = candidate_gain_ref_mse[
+        np.arange(candidate_gain_ref_mse.shape[0]), candidate_gain_ref_mae.argmax(axis=1)
+    ]
+
+    oracle_gain_ref_mse = reference_mse - oracle_mse if oracle_mse is not None else best_candidate_gain_mse
+    oracle_gain_ref_mae = reference_mae - oracle_mae if oracle_mae is not None else best_candidate_gain_mae
+    oracle_use = oracle_gain_ref_mae > 1e-12
+
+    ref_top_index = reference_prob.argmax(axis=1)
+    theta_top_index = policy_prob.argmax(axis=1)
+    ref_top_mae = candidate_mae[np.arange(candidate_mae.shape[0]), ref_top_index]
+    theta_top_mae = candidate_mae[np.arange(candidate_mae.shape[0]), theta_top_index]
+    ref_top_gain_mae = reference_mae - ref_top_mae
+    theta_top_gain_mae = reference_mae - theta_top_mae
+    expected_ref_candidate_mae = (reference_prob * candidate_mae).sum(axis=1)
+    expected_theta_candidate_mae = (policy_prob * candidate_mae).sum(axis=1)
+
+    print()
+    print(f"RPO mode: RAFT top-M utility rerank; utility reference = {reference_name}")
+    print(f"top-M candidate actions: {candidate_count}")
+    print(summarize("baseline_mse", baseline_mse))
+    print(summarize("baseline_mae", baseline_mae))
+    print(summarize(f"{reference_name}_reference_mse", reference_mse))
+    print(summarize(f"{reference_name}_reference_mae", reference_mae))
+    if raft is not None:
+        print(summarize("raft_always_retrieval_mse", raft_mse))
+        print(summarize("raft_always_retrieval_mae", raft_mae))
+    print(summarize("rpo_reranked_mse", reranked_mse))
+    print(summarize("rpo_reranked_mae", reranked_mae))
+    if selected_mse is not None:
+        print(summarize("rpo_hard_selected_mse", selected_mse))
+        print(summarize("rpo_hard_selected_mae", selected_mae))
+    if oracle_mse is not None:
+        print(summarize("oracle_topm_rerank_mse", oracle_mse))
+        print(summarize("oracle_topm_rerank_mae", oracle_mae))
+
+    print()
+    print(summarize("raft_always_gain_vs_baseline_mse", raft_gain_baseline_mse))
+    print(summarize("raft_always_gain_vs_baseline_mae", raft_gain_baseline_mae))
+    print(summarize("rpo_reranked_gain_vs_reference_mse", reranked_gain_ref_mse))
+    print(summarize("rpo_reranked_gain_vs_reference_mae", reranked_gain_ref_mae))
+    print(summarize("final_gain_vs_reference_mse", final_gain_ref_mse))
+    print(summarize("final_gain_vs_reference_mae", final_gain_ref_mae))
+    print(summarize("final_gain_vs_baseline_mse", baseline_mse - final_mse))
+    print(summarize("final_gain_vs_baseline_mae", baseline_mae - final_mae))
+    print(summarize("oracle_topm_gain_vs_reference_mse", oracle_gain_ref_mse))
+    print(summarize("oracle_topm_gain_vs_reference_mae", oracle_gain_ref_mae))
+    positive_oracle = oracle_gain_ref_mae > 1e-12
+    captured = np.zeros_like(final_gain_ref_mae)
+    captured[positive_oracle] = final_gain_ref_mae[positive_oracle] / np.maximum(
+        oracle_gain_ref_mae[positive_oracle],
+        1e-12,
+    )
+    print(summarize("rpo_gain_capture_vs_oracle_topm_mae", captured[positive_oracle] if positive_oracle.any() else captured))
+
+    print()
+    print_gain_rate_vs("RAFT always retrieval", "baseline (MSE)", raft_gain_baseline_mse)
+    print_gain_rate_vs("RPO rerank", "reference (MAE)", reranked_gain_ref_mae)
+    print_gain_rate_vs("final", "reference (MAE)", final_gain_ref_mae)
+    print_gain_rate_vs("oracle top-M rerank", "reference (MAE)", oracle_gain_ref_mae)
+
+    accept_prob = sample_mean(diag["rpo_accept_probability"]) if "rpo_accept_probability" in diag else None
+    predicted_utility = sample_mean(diag["rpo_predicted_utility"]) if "rpo_predicted_utility" in diag else None
+    action_index = diag["action_index"].reshape(-1).astype(np.int64) if "action_index" in diag else None
+    oracle_action_index = (
+        diag["oracle_action_index"].reshape(-1).astype(np.int64)
+        if "oracle_action_index" in diag else None
+    )
+
+    print()
+    reference_entropy = -(reference_prob * np.log(reference_prob + 1e-8)).sum(axis=1)
+    policy_entropy = -(policy_prob * np.log(policy_prob + 1e-8)).sum(axis=1)
+    policy_kl_ref = (policy_prob * (np.log(policy_prob + 1e-8) - np.log(reference_prob + 1e-8))).sum(axis=1)
+    print(summarize("pi_ref_entropy", reference_entropy))
+    print(summarize("pi_theta_entropy", policy_entropy))
+    print(summarize("kl(pi_theta || pi_ref)", policy_kl_ref))
+    print(summarize("ref_top1_candidate_gain_vs_reference_mae", ref_top_gain_mae))
+    print(summarize("theta_top1_candidate_gain_vs_reference_mae", theta_top_gain_mae))
+    print(summarize("expected_pi_ref_candidate_mae", expected_ref_candidate_mae))
+    print(summarize("expected_pi_theta_candidate_mae", expected_theta_candidate_mae))
+    print(summarize("best_candidate_gain_vs_reference_mae", best_candidate_gain_mae))
+    print(f"oracle best candidate equals RAFT-sim top1: {(ref_top_index == candidate_gain_ref_mae.argmax(axis=1)).mean():.2%}")
+    print(f"RPO top1 equals oracle best candidate: {(theta_top_index == candidate_gain_ref_mae.argmax(axis=1)).mean():.2%}")
+    print(f"RPO top1 differs from RAFT-sim top1: {(theta_top_index != ref_top_index).mean():.2%}")
+
+    if accept_prob is not None:
+        print()
+        print(summarize("rpo_accept_probability", accept_prob))
+        print(f"soft accept rate (p_accept>=0.5): {(accept_prob >= 0.5).mean():.2%}")
+        maybe_corr("corr(rpo_accept_probability, oracle_topm_gain_mae)", accept_prob, oracle_gain_ref_mae)
+        maybe_corr("corr(rpo_accept_probability, final_gain_ref_mae)", accept_prob, final_gain_ref_mae)
+    if predicted_utility is not None:
+        print(summarize("rpo_predicted_utility", predicted_utility))
+        maybe_corr("corr(rpo_predicted_utility, oracle_topm_gain_mae)", predicted_utility, oracle_gain_ref_mae)
+        maybe_corr("corr(rpo_predicted_utility, final_gain_ref_mae)", predicted_utility, final_gain_ref_mae)
+
+    if action_index is not None and oracle_action_index is not None:
+        model_use = action_index > 0
+        oracle_use = oracle_action_index > 0
+        print()
+        print(f"argmax action accuracy: {(action_index == oracle_action_index).mean():.2%}")
+        print(f"argmax model rerank-use rate: {model_use.mean():.2%}")
+        print(f"argmax oracle rerank-use rate: {oracle_use.mean():.2%}")
+        print(f"gate decision accuracy: {(model_use == oracle_use).mean():.2%}")
+        print(f"true fallback rate: {((~model_use) & (~oracle_use)).mean():.2%}")
+        print(f"false accept rate: {(model_use & (~oracle_use)).mean():.2%}")
+        print(f"false reject rate: {((~model_use) & oracle_use).mean():.2%}")
+        print_slice_summary("final_gain_ref_mae on oracle-use slice", oracle_use, final_gain_ref_mae)
+        print_slice_summary("final_gain_ref_mae on oracle-fallback slice", ~oracle_use, final_gain_ref_mae)
+        print_slice_summary("final_gain_ref_mae on false-accept slice", model_use & (~oracle_use), final_gain_ref_mae)
+        print_slice_summary("final_gain_ref_mae on false-reject slice", (~model_use) & oracle_use, final_gain_ref_mae)
+
+    if "rpo_pair_count" in diag:
+        print()
+        print(summarize("rpo_pair_count", sample_mean(diag["rpo_pair_count"])))
+    print(summarize("candidate_similarity_mean", candidate_similarity.mean(axis=1)))
+    print(summarize("candidate_similarity_max", candidate_similarity.max(axis=1)))
+    print(summarize("candidate_score_mean", candidate_scores.mean(axis=1)))
+    print(summarize("candidate_score_max", candidate_scores.max(axis=1)))
+    maybe_corr("corr(candidate_similarity_max, best_candidate_gain_mae)", candidate_similarity.max(axis=1), best_candidate_gain_mae)
+    maybe_corr("corr(candidate_score_max, best_candidate_gain_mae)", candidate_scores.max(axis=1), best_candidate_gain_mae)
+
+    print()
+    print("Period-level candidate utility:")
+    for period in sorted(np.unique(candidate_period.astype(int).reshape(-1)), reverse=True):
+        mask = candidate_period.astype(int) == period
+        period_gain = np.where(mask, candidate_gain_ref_mae, np.nan)
+        period_best = np.nanmax(period_gain, axis=1)
+        period_policy_mass = (policy_prob * mask).sum(axis=1)
+        period_ref_mass = (reference_prob * mask).sum(axis=1)
+        oracle_period = candidate_period[np.arange(candidate_period.shape[0]), candidate_gain_ref_mae.argmax(axis=1)]
+        print(summarize_finite(f"period_{period}_best_gain_vs_reference_mae", period_best))
+        print(summarize(f"period_{period}_pi_ref_mass", period_ref_mass))
+        print(summarize(f"period_{period}_pi_theta_mass", period_policy_mass))
+        print(f"period_{period}_oracle_best_rate: {(oracle_period.astype(int) == period).mean():.2%}")
+
+    print()
+    print("Rank-level candidate utility:")
+    max_rank_to_print = min(5, int(np.nanmax(candidate_rank)) + 1)
+    for rank in range(max_rank_to_print):
+        mask = candidate_rank.astype(int) == rank
+        rank_gain = np.where(mask, candidate_gain_ref_mae, np.nan)
+        print(summarize_finite(f"rank_{rank}_gain_vs_reference_mae", rank_gain.reshape(-1)))
+        print(f"rank_{rank}_oracle_best_rate: {((candidate_gain_ref_mae.argmax(axis=1)[:, None] == np.arange(candidate_count)[None, :]) & mask).any(axis=1).mean():.2%}")
+
+    print()
+    if oracle_gain_ref_mae.mean() <= 0:
+        print("Likely bottleneck: RAFT top-M recall. Even oracle top-M reranking cannot beat the reference on average.")
+    elif reranked_gain_ref_mae.mean() <= 0 < oracle_gain_ref_mae.mean():
+        print("Likely bottleneck: RPO reranker. Oracle top-M candidates help, but pi_theta does not select/use them yet.")
+    elif final_gain_ref_mae.mean() <= 0 < reranked_gain_ref_mae.mean():
+        print("Likely bottleneck: utility gate. Reranking helps, but fallback/use decision loses the gain.")
+    elif final_gain_ref_mae.mean() > 0 and final_gain_ref_mae.mean() >= reranked_gain_ref_mae.mean():
+        print("RPO is useful: final gated forecast improves over the reference forecast on average.")
+    elif final_gain_ref_mae.mean() > 0:
+        print("RPO reranking is useful, but the gate is not preserving all rerank gain.")
+    else:
+        print("No clear RPO benefit: inspect oracle headroom, pi_theta top1 accuracy, and false accept/reject slices.")
+
+    print("\nInterpretation guide:")
+    print("- oracle_topm_gain_vs_reference_mae > 0: RAFT top-M contains useful forecast candidates.")
+    print("- rpo_reranked_gain_vs_reference_mae > 0: learned RPO reranking improves over the RAFT/reference policy.")
+    print("- final_gain_vs_reference_mae > 0: rerank + utility gate improves the selected reference forecast.")
+    print("- RPO top1 equals oracle best candidate: reranker quality inside the retrieved top-M set.")
+    print("- false accept/reject rates: whether predicted utility is gating harmful/useful reranks correctly.")
+    print("- period/rank utility tables show where useful retrieval candidates are found.")
 
 
 def analyze_raft_rpo(result_dir, pred, true, diag, final_mse, final_mae):
@@ -264,6 +506,14 @@ def main():
     final_mae = mae(pred, true)
     print(summarize("final_mse", final_mse))
     print(summarize("final_mae", final_mae))
+
+    if (
+        "rpo_candidate_mae" in diag
+        and "rpo_reference_forecast" in diag
+        and "rpo_policy_probabilities" in diag
+    ):
+        analyze_raft_topm_rpo(result_dir, pred, true, diag, final_mse, final_mae)
+        return
 
     if "rpo_candidate_mse" in diag and (
         "rpo_action_probabilities" in diag or "action_probabilities" in diag
