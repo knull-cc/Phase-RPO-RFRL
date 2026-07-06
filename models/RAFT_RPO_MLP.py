@@ -313,6 +313,7 @@ class Model(nn.Module):
             final_mae = (final_cmp - target).abs().mean(dim=(1, 2))
             reranked_mse = ((reranked_cmp - target) ** 2).mean(dim=(1, 2))
             reranked_mae = (reranked_cmp - target).abs().mean(dim=(1, 2))
+            reranked_gain_mae = reference_mae - reranked_mae
 
             candidate_gain_mse = reference_mse.unsqueeze(1) - candidate_mse
             candidate_gain_mae = reference_mae.unsqueeze(1) - candidate_mae
@@ -346,11 +347,13 @@ class Model(nn.Module):
                     rpo['policy_log_probability'],
                     rpo['reference_log_probability'],
                 )
-                gate_target = oracle_use.detach().to(rpo['gate_logit'].dtype)
+                gate_target = (reranked_gain_mae.detach() > self.rpo_gain_margin).to(
+                    rpo['gate_logit'].dtype
+                )
                 gate_loss = self._binary_preference_loss(rpo['gate_logit'], gate_target)
                 utility_loss = F.smooth_l1_loss(
                     rpo['predicted_utility'],
-                    oracle_gain_mae.detach(),
+                    reranked_gain_mae.detach(),
                 )
                 top1_loss = F.cross_entropy(
                     rpo['policy_logits'],
@@ -388,6 +391,7 @@ class Model(nn.Module):
                     'rpo_pair_count': pair_count,
                     'reference_mae': reference_mae.mean().detach(),
                     'oracle_gain_mae': oracle_gain_mae.mean().detach(),
+                    'reranked_gain_mae': reranked_gain_mae.mean().detach(),
                     'final_mae': final_mae.mean().detach(),
                 }
 
@@ -461,6 +465,7 @@ class Model(nn.Module):
                 'retrieval_mae_err': raft_mae.detach(),
                 'reranked_err': reranked_mse.detach(),
                 'reranked_mae_err': reranked_mae.detach(),
+                'reranked_gain_mae': reranked_gain_mae.detach(),
                 'final_err': final_mse.detach(),
                 'final_mae_err': final_mae.detach(),
                 'oracle_err': oracle_mse.detach(),
