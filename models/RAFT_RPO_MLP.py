@@ -187,10 +187,13 @@ class Model(nn.Module):
         weight = torch.where(target > 0, 0.5 / pos_rate, 0.5 / (1.0 - pos_rate))
         return F.binary_cross_entropy_with_logits(gate_logit, target, weight=weight)
 
-    def _dpo_pair_loss(self, candidate_mae, policy_log_probability, reference_log_probability):
+    def _candidate_preference_pair_mask(self, candidate_mae):
         better_than = candidate_mae.unsqueeze(2) + self.rpo_pair_margin
         worse_than = candidate_mae.unsqueeze(1)
-        pair_mask = better_than < worse_than
+        return better_than < worse_than
+
+    def _dpo_pair_loss(self, candidate_mae, policy_log_probability, reference_log_probability):
+        pair_mask = self._candidate_preference_pair_mask(candidate_mae)
         if not pair_mask.any():
             return policy_log_probability.sum() * 0.0, pair_mask
 
@@ -286,6 +289,7 @@ class Model(nn.Module):
         oracle_mae = None
         best_candidate_mse = None
         best_candidate_mae = None
+        diagnostic_pair_mask = None
 
         if target_y is not None:
             target = self._select_feature(target_y[:, -self.pred_len:, :])
@@ -298,6 +302,7 @@ class Model(nn.Module):
 
             candidate_mse = ((candidate_cmp - target.unsqueeze(1)) ** 2).mean(dim=(2, 3))
             candidate_mae = (candidate_cmp - target.unsqueeze(1)).abs().mean(dim=(2, 3))
+            diagnostic_pair_mask = self._candidate_preference_pair_mask(candidate_mae.detach())
             reference_mse = ((reference_cmp - target) ** 2).mean(dim=(1, 2))
             reference_mae = (reference_cmp - target).abs().mean(dim=(1, 2))
             baseline_mse = ((baseline_cmp - target) ** 2).mean(dim=(1, 2))
@@ -437,8 +442,8 @@ class Model(nn.Module):
                 candidate_period.to(dtype=x_enc.dtype),
             ], dim=1)
             pair_count_per_sample = (
-                pair_mask.float().sum(dim=(1, 2))
-                if pair_mask is not None
+                diagnostic_pair_mask.float().sum(dim=(1, 2))
+                if diagnostic_pair_mask is not None
                 else torch.zeros(x_enc.size(0), device=x_enc.device, dtype=x_enc.dtype)
             )
             self.latest_diagnostics.update({
