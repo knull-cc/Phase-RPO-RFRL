@@ -128,6 +128,32 @@ def build_parser():
     parser.add_argument('--retrieval_residual_init', type=float, default=0.1,
                         help='initial scale for retrieval residual corrections')
 
+    # RAFT-RPO arguments (used by RAFT_RPO_* models)
+    parser.add_argument('--n_period', type=int, default=3,
+                        help='number of RAFT multi-granularity periods')
+    parser.add_argument('--topm', type=int, default=20,
+                        help='number of train windows softly retrieved per RAFT period')
+    parser.add_argument('--raft_temperature', type=float, default=0.1,
+                        help='softmax temperature for RAFT top-m retrieval weights')
+    parser.add_argument('--raft_max_bank_size', type=int, default=4096,
+                        help='maximum train windows kept in the RAFT retrieval bank')
+    parser.add_argument('--raft_exclusion_radius', type=int, default=0,
+                        help='train-time retrieval exclusion radius; 0 uses seq_len + pred_len')
+    parser.add_argument('--rpo_hidden_size', type=int, default=64,
+                        help='hidden size for the RAFT-RPO action scorer')
+    parser.add_argument('--rpo_no_retrieval_bias', type=float, default=1.0,
+                        help='initial action-logit bias for the no-retrieval action in RAFT-RPO')
+    parser.add_argument('--rpo_softmax_temperature', type=float, default=1.0,
+                        help='temperature for RAFT-RPO action probabilities')
+    parser.add_argument('--rpo_pairwise_loss_weight', type=float, default=0.2,
+                        help='weight of retrieval-vs-baseline pairwise preference loss inside RAFT-RPO')
+    parser.add_argument('--rpo_retrieval_loss_weight', type=float, default=0.2,
+                        help='auxiliary loss weight for the always-retrieve RAFT branch')
+    parser.add_argument('--rpo_entropy_weight', type=float, default=0.0,
+                        help='optional entropy bonus weight for RAFT-RPO action probabilities')
+    parser.add_argument('--rpo_hard_eval', action='store_true', default=False,
+                        help='use argmax RPO action at validation/test time instead of soft expected action')
+
     # optimization
     parser.add_argument('--num_workers', type=int, default=10, help='data loader num workers')
     parser.add_argument('--itr', type=int, default=1, help='experiments times')

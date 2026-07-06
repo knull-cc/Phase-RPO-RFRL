@@ -1,6 +1,5 @@
-from data_provider.data_loader import Dataset_ETT_hour, Dataset_ETT_minute, Dataset_Custom, Dataset_PEMS, Dataset_Solar
+from data_provider.data_loader import Dataset_ETT_hour, Dataset_ETT_minute, Dataset_Custom
 from torch.utils.data import DataLoader
-from torch.utils.data import Dataset
 
 data_dict = {
     'ETTh1': Dataset_ETT_hour,
@@ -8,23 +7,7 @@ data_dict = {
     'ETTm1': Dataset_ETT_minute,
     'ETTm2': Dataset_ETT_minute,
     'custom': Dataset_Custom,
-    'PEMS': Dataset_PEMS,
-    'Solar': Dataset_Solar,
 }
-
-
-class IndexedDataset(Dataset):
-    def __init__(self, dataset):
-        self.dataset = dataset
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, index):
-        return (index, *self.dataset[index])
-
-    def __getattr__(self, name):
-        return getattr(self.dataset, name)
 
 
 def data_provider(args, flag):
@@ -51,9 +34,6 @@ def data_provider(args, flag):
         seasonal_patterns=None # We do not use this option.
     )
     print(flag, len(data_set))
-    if args.model.startswith('PhaseRPO_RFRL_') or args.model.startswith('RAFT_RPO_'):
-        data_set = IndexedDataset(data_set)
-
     data_loader = DataLoader(
         data_set,
         batch_size=batch_size,

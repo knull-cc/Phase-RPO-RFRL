@@ -70,6 +70,183 @@ def print_slice_summary(name, mask, values):
         print(f"{name}: n={mask.sum()} ({mask.mean():.2%}), mean={values[mask].mean():.6f}")
 
 
+def action_labels(diag, action_count):
+    if "rpo_action_names" not in diag:
+        return ["baseline", "raft_fused"] + [f"candidate_{idx}" for idx in range(2, action_count)]
+    values = diag["rpo_action_names"][0].reshape(-1)
+    labels = []
+    for idx in range(action_count):
+        if idx == 0:
+            labels.append("baseline")
+        elif idx == 1:
+            labels.append("raft_fused")
+        else:
+            labels.append(f"period_g{int(round(float(values[idx])))}")
+    return labels
+
+
+def analyze_raft_rpo(result_dir, pred, true, diag, final_mse, final_mae):
+    if "baseline" not in diag or "rpo_candidate_mse" not in diag:
+        print("\nThis RAFT-RPO run is missing baseline or candidate diagnostics.")
+        return
+
+    baseline = maybe_get_prediction(diag, "baseline", pred)
+    baseline_mse = mse(baseline, true)
+    candidate_mse = np.asarray(diag["rpo_candidate_mse"])
+    if candidate_mse.ndim != 2:
+        candidate_mse = candidate_mse.reshape(candidate_mse.shape[0], -1)
+    candidate_gain = baseline_mse[:, None] - candidate_mse
+    labels = action_labels(diag, candidate_mse.shape[1])
+
+    raw_retrieval = maybe_get_prediction(diag, "raw_retrieval_forecast", pred)
+    conditional_retrieval = maybe_get_prediction(diag, "retrieval_forecast", pred)
+    selected_forecast = maybe_get_prediction(diag, "rpo_selected_forecast", pred)
+    oracle_forecast = maybe_get_prediction(diag, "rpo_oracle_forecast", pred)
+
+    raw_mse = mse(raw_retrieval, true) if raw_retrieval is not None else candidate_mse[:, 1]
+    conditional_mse = mse(conditional_retrieval, true) if conditional_retrieval is not None else None
+    selected_mse = mse(selected_forecast, true) if selected_forecast is not None else None
+    oracle_mse = mse(oracle_forecast, true) if oracle_forecast is not None else None
+    if oracle_mse is None and "oracle_err" in diag:
+        oracle_mse = sample_mean(diag["oracle_err"])
+
+    final_gain = baseline_mse - final_mse
+    raw_gain = baseline_mse - raw_mse
+    conditional_gain = baseline_mse - conditional_mse if conditional_mse is not None else None
+    selected_gain = baseline_mse - selected_mse if selected_mse is not None else None
+    oracle_gain = baseline_mse - oracle_mse if oracle_mse is not None else None
+
+    print()
+    print(summarize("baseline_mse", baseline_mse))
+    print(summarize("raft_always_retrieval_mse", raw_mse))
+    if conditional_mse is not None:
+        print(summarize("rpo_conditional_retrieval_mse", conditional_mse))
+    if selected_mse is not None:
+        print(summarize("rpo_argmax_action_mse", selected_mse))
+    if oracle_mse is not None:
+        print(summarize("oracle_action_mse", oracle_mse))
+
+    print()
+    print(summarize("final_gain_vs_baseline", final_gain))
+    print(summarize("raft_always_gain_vs_baseline", raw_gain))
+    if conditional_gain is not None:
+        print(summarize("rpo_conditional_retrieval_gain_vs_baseline", conditional_gain))
+    if selected_gain is not None:
+        print(summarize("rpo_argmax_action_gain_vs_baseline", selected_gain))
+    if oracle_gain is not None:
+        print(summarize("oracle_action_gain_vs_baseline", oracle_gain))
+        print(summarize("policy_regret_vs_oracle", final_mse - oracle_mse))
+        positive_oracle = oracle_gain > 1e-12
+        captured = np.zeros_like(final_gain)
+        captured[positive_oracle] = final_gain[positive_oracle] / np.maximum(oracle_gain[positive_oracle], 1e-12)
+        print(summarize("rpo_gain_capture_on_oracle_positive", captured[positive_oracle] if positive_oracle.any() else captured))
+
+    print()
+    print_gain_rate("final", final_gain)
+    print_gain_rate("raft always retrieval", raw_gain)
+    if selected_gain is not None:
+        print_gain_rate("rpo argmax action", selected_gain)
+    if oracle_gain is not None:
+        print_gain_rate("oracle action", oracle_gain)
+
+    probs = diag["rpo_action_probabilities"] if "rpo_action_probabilities" in diag else diag.get("action_probabilities")
+    action_index = diag["action_index"].reshape(-1).astype(np.int64) if "action_index" in diag else None
+    oracle_action_index = (
+        diag["oracle_action_index"].reshape(-1).astype(np.int64)
+        if "oracle_action_index" in diag else None
+    )
+
+    print()
+    print("RPO action set:", ", ".join(f"{idx}={name}" for idx, name in enumerate(labels)))
+    if probs is not None:
+        entropy = -(probs * np.log(probs + 1e-8)).sum(axis=1)
+        no_retrieval_prob = probs[:, 0]
+        accept_prob = probs[:, 1:].sum(axis=1)
+        print(summarize("rpo_action_probability_entropy", entropy))
+        print(summarize("rpo_no_retrieval_probability", no_retrieval_prob))
+        print(summarize("rpo_accept_probability", accept_prob))
+        print(f"soft RPO accept rate (p_retrieval>=0.5): {(accept_prob >= 0.5).mean():.2%}")
+        maybe_corr("corr(rpo_accept_probability, final_gain)", accept_prob, final_gain)
+        maybe_corr("corr(rpo_accept_probability, raft_always_gain)", accept_prob, raw_gain)
+        if oracle_gain is not None:
+            maybe_corr("corr(rpo_accept_probability, oracle_action_gain)", accept_prob, oracle_gain)
+
+    if action_index is not None and oracle_action_index is not None:
+        model_use = action_index > 0
+        oracle_use = oracle_action_index > 0
+        print()
+        print(f"argmax action accuracy: {(action_index == oracle_action_index).mean():.2%}")
+        print(f"argmax model retrieval-use rate: {model_use.mean():.2%}")
+        print(f"argmax oracle retrieval-use rate: {oracle_use.mean():.2%}")
+        print(f"abstention decision accuracy: {(model_use == oracle_use).mean():.2%}")
+        print(f"true reject rate: {((~model_use) & (~oracle_use)).mean():.2%}")
+        print(f"false accept rate: {(model_use & (~oracle_use)).mean():.2%}")
+        print(f"false reject rate: {((~model_use) & oracle_use).mean():.2%}")
+        print_slice_summary("final_gain on oracle-use slice", oracle_use, final_gain)
+        print_slice_summary("final_gain on oracle-abstain slice", ~oracle_use, final_gain)
+        print_slice_summary("final_gain on false-accept slice", model_use & (~oracle_use), final_gain)
+        print_slice_summary("final_gain on false-reject slice", (~model_use) & oracle_use, final_gain)
+
+    print()
+    for idx, name in enumerate(labels):
+        cur_mse = candidate_mse[:, idx]
+        cur_gain = candidate_gain[:, idx]
+        print(summarize(f"candidate_{idx}_{name}_mse", cur_mse))
+        print(summarize(f"candidate_{idx}_{name}_gain_vs_baseline", cur_gain))
+        print(f"candidate_{idx}_{name} better than baseline: {(cur_gain > 0).mean():.2%}")
+        if probs is not None:
+            print(summarize(f"candidate_{idx}_{name}_probability", probs[:, idx]))
+        if action_index is not None:
+            print(f"candidate_{idx}_{name} argmax rate: {(action_index == idx).mean():.2%}")
+        if oracle_action_index is not None:
+            print(f"candidate_{idx}_{name} oracle rate: {(oracle_action_index == idx).mean():.2%}")
+        print()
+
+    if "rpo_best_retrieval_gain" in diag:
+        best_retrieval_gain = sample_mean(diag["rpo_best_retrieval_gain"])
+        print(summarize("best_retrieval_candidate_gain_vs_baseline", best_retrieval_gain))
+        print(f"best retrieval candidate better than baseline: {(best_retrieval_gain > 0).mean():.2%}")
+
+    if "policy_regret" in diag:
+        print(summarize("saved_policy_regret", sample_mean(diag["policy_regret"])))
+
+    for key in [
+        "top_similarity",
+        "primary_top_similarity",
+        "period_similarity",
+    ]:
+        if key in diag:
+            value = sample_mean(diag[key])
+            print()
+            print(summarize(key, value))
+            maybe_corr(f"corr({key}, raft_always_gain)", value, raw_gain)
+            maybe_corr(f"corr({key}, final_gain)", value, final_gain)
+
+    print()
+    if oracle_gain is not None and oracle_gain.mean() <= 0:
+        print("Likely bottleneck: RAFT retrieval candidates. Even oracle RPO cannot beat the host baseline on average.")
+    elif raw_gain.mean() <= 0 and final_gain.mean() > raw_gain.mean():
+        print("RPO is filtering harmful RAFT retrieval better than always-retrieve, but check whether final_gain is positive.")
+    elif raw_gain.mean() > 0 and final_gain.mean() <= raw_gain.mean():
+        print("Likely bottleneck: RPO action scorer. RAFT retrieval helps, but RPO loses part of the available gain.")
+    elif oracle_gain is not None and final_gain.mean() <= 0 < oracle_gain.mean():
+        print("Likely bottleneck: RPO action scorer. Oracle actions help, learned preferences still leave regret.")
+    elif final_gain.mean() > raw_gain.mean() and final_gain.mean() > 0:
+        print("RPO is useful: final forecast improves over both host baseline and always-retrieve RAFT on average.")
+    elif final_gain.mean() > 0:
+        print("Final forecast improves over baseline, but RPO does not clearly beat always-retrieve RAFT yet.")
+    else:
+        print("No clear RPO benefit: inspect false accepts/rejects and candidate-level oracle rates.")
+
+    print("\nInterpretation guide:")
+    print("- raft_always_gain_vs_baseline > 0: the original RAFT retrieval branch is useful before RPO.")
+    print("- oracle_action_gain_vs_baseline > 0: the action set contains useful retrieval/no-retrieval decisions.")
+    print("- final_gain_vs_baseline > raft_always_gain_vs_baseline: RPO improves over always using RAFT retrieval.")
+    print("- high false accept rate: RPO still accepts retrieval when oracle would choose baseline.")
+    print("- high false reject rate: RPO rejects useful RAFT retrieval candidates.")
+    print("- candidate oracle rate shows which RAFT period/action actually carries useful signal.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Analyze Phase-RPO-RFRL retrieval diagnostics.")
     parser.add_argument("result_dir", help="A results/ directory with pred.npy, true.npy and retrieval_diagnostics.npz")
@@ -87,6 +264,12 @@ def main():
     final_mae = mae(pred, true)
     print(summarize("final_mse", final_mse))
     print(summarize("final_mae", final_mae))
+
+    if "rpo_candidate_mse" in diag and (
+        "rpo_action_probabilities" in diag or "action_probabilities" in diag
+    ):
+        analyze_raft_rpo(result_dir, pred, true, diag, final_mse, final_mae)
+        return
 
     if "baseline" not in diag or "retrieval_forecast" not in diag:
         print("\nThis run does not contain baseline/retrieval counterfactuals.")

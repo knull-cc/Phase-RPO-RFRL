@@ -46,6 +46,38 @@ python run.py ... --model PhaseRPO_RFRL_MLP
 常用可调参数包括 `--mlp_hidden_dim`、`--mlp_dropout`、`--mlp_use_revin`、`--mlp_spectral_bins`、`--retrieval_mode`、`--retrieval_top_k`、`--retrieval_top_m`、`--retrieval_time_key_len`、`--phase_max_freqs`、`--phase_similarity_weight`、`--amplitude_similarity_weight`、`--rfrl_alpha_bins`、`--rfrl_no_retrieval_bias`、`--rfrl_regret_loss_weight`、`--rpo_gain_margin`、`--rfrl_gain_margin`、`--rpo_loss_weight`、`--rfrl_loss_weight`、`--host_anchor_loss_weight`、`--retrieval_adapter_loss_weight`、`--retrieval_correction_reg_weight`、`--retrieval_correction_clip`、`--retrieval_residual_init` 和 `--retrieval_cost`。
 测试后可以用 `tools/analyze_retrieval_diagnostics.py <result_dir>` 查看 baseline、raw retrieval、adapter correction、oracle alpha、model action alpha、policy regret、false accept、false reject、abstention accuracy 和相似度相关性，判断瓶颈在检索、adapter、RPO 风险判断还是 RFRL 动作策略。
 
+RAFT-RPO
+
+当前还提供 `RAFT_RPO_MLP`，用于验证“先退化到 RAFT 检索，再只加 RPO”的路线。它参考 `example/RAFT - 原始版本/` 的核心检索方式：训练开始前用 train split 构建 lookback/future 记忆库，对输入窗口做多周期平均分解，在每个周期粒度上用相关性检索 top-m 历史窗口，并 soft 聚合对应 future residual。
+
+在 RAFT-RPO 中，RPO 不是 RFRL，也不是相位 gate。每个样本的候选动作是：
+
+* `0=baseline`：只使用 host 线性预测。
+* `1=raft_fused`：使用 RAFT 的多周期检索融合预测。
+* `2..G+1=period_g*`：分别使用某个 RAFT 周期粒度的检索预测。
+
+训练时用真实未来值计算每个动作的 MSE，把误差最低且超过 `--rpo_gain_margin` 的动作作为 oracle preferred action；如果没有检索动作优于 baseline，则 oracle action 为 `baseline`。RPO scorer 根据当前输入、候选预测差异、检索相似度、top-m 权重熵等特征输出动作概率，最终默认使用 soft expected action 生成预测：
+
+final = sum_a p(a | x, candidates) * forecast_a
+
+因此判断 RPO 是否有效时，不只看 final MSE，还要看它是否优于 `raft_always_retrieval_mse`，以及 false accept / false reject 是否下降。
+
+运行示例：
+
+python run.py \
+  --task_name long_term_forecast --is_training 1 \
+  --data ETTh1 --root_path ./dataset/ETT-small/ --data_path ETTh1.csv \
+  --model_id ETTh1_96_96 --model RAFT_RPO_MLP \
+  --features M --seq_len 96 --label_len 48 --pred_len 96 \
+  --enc_in 7 --dec_in 7 --c_out 7 \
+  --n_period 3 --topm 20 --des RAFT_RPO
+
+测试后运行：
+
+python tools/analyze_retrieval_diagnostics.py results/<result_dir>
+
+RAFT-RPO 日志会额外输出 `raft_always_gain_vs_baseline`、`oracle_action_gain_vs_baseline`、`final_gain_vs_baseline`、`policy_regret_vs_oracle`、RPO action set、每个候选动作的 MSE/gain/probability/oracle rate、argmax action accuracy、abstention decision accuracy、false accept rate、false reject rate，以及相似度与 gain 的相关性。
+
 目录结构
 
 TSF-Lib/
