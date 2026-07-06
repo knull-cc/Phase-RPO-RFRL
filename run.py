@@ -80,18 +80,36 @@ def build_parser():
                         help='enable Phase-RPO-RFRL retrieval-control branch for PhaseRPO_RFRL_* models')
     parser.add_argument('--disable_phase_rpo_rfrl', action='store_false', dest='use_phase_rpo_rfrl',
                         help='disable Phase-RPO-RFRL branch when the selected model supports that switch')
-    parser.add_argument('--phase_top_k', type=int, default=8, help='top-k retrieval candidates')
-    parser.add_argument('--phase_max_freqs', type=int, default=16, help='number of non-zero FFT bins used by phase retrieval')
-    parser.add_argument('--phase_temperature', type=float, default=0.07, help='retrieval softmax temperature')
+    parser.add_argument('--retrieval_mode', type=str, default='time_phase_rerank',
+                        choices=['time_phase_rerank', 'time', 'phase'],
+                        help='retrieval mode: time-domain primary, time-only, or phase-only ablation')
+    parser.add_argument('--retrieval_top_k', type=int, default=None,
+                        help='time-domain primary top-k before phase reranking; None uses --phase_top_k')
+    parser.add_argument('--retrieval_top_m', type=int, default=8,
+                        help='final candidate count after phase reranking')
+    parser.add_argument('--retrieval_time_key_len', type=int, default=96,
+                        help='pooled length for normalized time-domain retrieval keys')
+    parser.add_argument('--retrieval_temperature', type=float, default=None,
+                        help='retrieval softmax temperature; None uses --phase_temperature')
+    parser.add_argument('--phase_top_k', type=int, default=32,
+                        help='legacy alias for primary retrieval top-k when --retrieval_top_k is omitted')
+    parser.add_argument('--phase_max_freqs', type=int, default=24,
+                        help='number of log-spaced FFT bins used by phase reranking')
+    parser.add_argument('--phase_temperature', type=float, default=0.10,
+                        help='legacy retrieval softmax temperature')
     parser.add_argument('--phase_max_bank_size', type=int, default=4096, help='maximum train windows kept in retrieval bank')
     parser.add_argument('--phase_exclusion_radius', type=int, default=0,
                         help='train-time exclusion radius; 0 uses seq_len + pred_len')
-    parser.add_argument('--phase_similarity_weight', type=float, default=0.55, help='phase similarity weight')
-    parser.add_argument('--amplitude_similarity_weight', type=float, default=0.25, help='amplitude similarity weight')
-    parser.add_argument('--time_similarity_weight', type=float, default=0.20, help='time-domain similarity weight')
+    parser.add_argument('--phase_similarity_weight', type=float, default=0.20, help='phase reranking weight')
+    parser.add_argument('--amplitude_similarity_weight', type=float, default=0.10, help='amplitude reranking weight')
+    parser.add_argument('--time_similarity_weight', type=float, default=1.00, help='time-domain similarity weight')
     parser.add_argument('--rfrl_hidden_size', type=int, default=64, help='RFRL controller hidden size')
+    parser.add_argument('--rfrl_alpha_bins', type=str, default='0,0.05,0.1,0.2,0.4',
+                        help='comma-separated retrieval action strengths used by RFRL')
     parser.add_argument('--rpo_loss_weight', type=float, default=0.1, help='RPO preference auxiliary loss weight')
     parser.add_argument('--rfrl_loss_weight', type=float, default=0.05, help='RFRL policy auxiliary loss weight')
+    parser.add_argument('--retrieval_adapter_loss_weight', type=float, default=0.02,
+                        help='supervised residual adapter auxiliary loss weight')
     parser.add_argument('--retrieval_cost', type=float, default=0.01, help='penalty for high retrieval/fusion usage')
     parser.add_argument('--retrieval_residual_init', type=float, default=0.1,
                         help='initial scale for retrieval residual corrections')

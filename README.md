@@ -23,19 +23,23 @@ TSF-Lib
 
 Phase-RPO-RFRL
 
-当前实现只保留 `PhaseRPO_RFRL_MLP`。它不使用周期查询机制；host 的先验来自输入窗口自身的频域摘要，方法先验来自相位检索。
+当前实现只保留 `PhaseRPO_RFRL_MLP`。它不使用周期查询机制；host 的先验来自输入窗口自身的频域摘要，检索插件采用时域相似度主召回，并把相位/幅值作为候选重排信号。
 
 当前流程为：
 
-RevIN Residual MLP Host -> Phase-aware residual retrieval -> RPO preference -> RFRL Controller -> Adaptive Fusion
+RevIN Residual MLP Host -> time-domain retrieval top-K -> phase/amplitude rerank top-M -> residual adapter -> RPO risk score -> RFRL action alpha -> Adaptive Fusion
 
 模型会在训练开始前用 train split 构建时间安全的 retrieval bank。检索分支返回候选 future 相对候选历史末端的 residual/delta，而不是把候选绝对 future 当作完整预测。
+RPO 不直接乘到预测上，而是学习当前检索修正是否有收益的 risk/preference score；RFRL 使用该 score 作为控制特征，输出最终残差动作强度 `action_alpha`，最终形式为：
+
+final = baseline + action_alpha * retrieval_correction
 
 运行默认模型：
 
 python run.py ... --model PhaseRPO_RFRL_MLP
 
-常用可调参数包括 `--mlp_hidden_dim`、`--mlp_dropout`、`--mlp_use_revin`、`--mlp_spectral_bins`、`--phase_top_k`、`--phase_max_freqs`、`--phase_max_bank_size`、`--rpo_loss_weight`、`--rfrl_loss_weight`、`--retrieval_residual_init` 和 `--retrieval_cost`。
+常用可调参数包括 `--mlp_hidden_dim`、`--mlp_dropout`、`--mlp_use_revin`、`--mlp_spectral_bins`、`--retrieval_mode`、`--retrieval_top_k`、`--retrieval_top_m`、`--retrieval_time_key_len`、`--phase_max_freqs`、`--phase_similarity_weight`、`--amplitude_similarity_weight`、`--rfrl_alpha_bins`、`--rpo_loss_weight`、`--rfrl_loss_weight`、`--retrieval_adapter_loss_weight`、`--retrieval_residual_init` 和 `--retrieval_cost`。
+测试后可以用 `tools/analyze_retrieval_diagnostics.py <result_dir>` 查看 baseline、raw retrieval、adapter correction、oracle alpha、model action alpha 和相似度相关性，判断瓶颈在检索、adapter 还是 RFRL 控制器。
 
 目录结构
 

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from layers.PhaseRPO_RFRL import PhaseAwareRetrievalBank, RetrievalPreferenceController, AdaptiveFusion
+from layers.PhaseRPO_RFRL import TemporalPhaseRetrievalBank, RetrievalActionController, AdaptiveFusion
 
 
 class RevIN(nn.Module):
@@ -100,6 +100,19 @@ class SpectralResidualMLPHost(nn.Module):
         return out
 
 
+def _parse_alpha_bins(value):
+    if isinstance(value, str):
+        values = [item.strip() for item in value.split(',') if item.strip()]
+        bins = [float(item) for item in values]
+    elif isinstance(value, (list, tuple)):
+        bins = [float(item) for item in value]
+    else:
+        bins = [0.0, 0.05, 0.10, 0.20, 0.40]
+
+    bins = sorted({min(max(item, 0.0), 1.0) for item in bins})
+    return bins or [0.0, 0.10, 0.20]
+
+
 class Model(nn.Module):
     """
     Phase-RPO-RFRL backbone with a frequency-aware residual MLP host.
@@ -130,32 +143,43 @@ class Model(nn.Module):
 
         self.rpo_loss_weight = getattr(configs, 'rpo_loss_weight', 0.1)
         self.rfrl_loss_weight = getattr(configs, 'rfrl_loss_weight', 0.05)
+        self.retrieval_adapter_loss_weight = getattr(configs, 'retrieval_adapter_loss_weight', 0.02)
         self.retrieval_cost = getattr(configs, 'retrieval_cost', 0.01)
         self.retrieval_residual_scale = nn.Parameter(
             torch.tensor(float(getattr(configs, 'retrieval_residual_init', 0.1)))
         )
         self.use_phase_rpo_rfrl = getattr(configs, 'use_phase_rpo_rfrl', True)
         self.latest_aux_loss = None
+        self.latest_aux_details = {}
         self.latest_diagnostics = {}
 
-        top_k = getattr(configs, 'phase_top_k', 8)
-        max_freqs = getattr(configs, 'phase_max_freqs', 16)
-        temperature = getattr(configs, 'phase_temperature', 0.07)
+        legacy_top_k = getattr(configs, 'phase_top_k', 32)
+        retrieval_top_k = getattr(configs, 'retrieval_top_k', None)
+        retrieval_top_k = legacy_top_k if retrieval_top_k is None else retrieval_top_k
+        retrieval_top_m = getattr(configs, 'retrieval_top_m', 8)
+        max_freqs = getattr(configs, 'phase_max_freqs', 24)
+        legacy_temperature = getattr(configs, 'phase_temperature', 0.10)
+        temperature = getattr(configs, 'retrieval_temperature', None)
+        temperature = legacy_temperature if temperature is None else temperature
         max_bank_size = getattr(configs, 'phase_max_bank_size', 4096)
         exclusion_radius = getattr(configs, 'phase_exclusion_radius', self.seq_len + self.pred_len)
-        self.phase_retrieval = PhaseAwareRetrievalBank(
+        self.retrieval_bank = TemporalPhaseRetrievalBank(
             seq_len=self.seq_len,
             pred_len=self.pred_len,
             channels=self.channels,
-            top_k=top_k,
+            primary_top_k=retrieval_top_k,
+            rerank_top_m=retrieval_top_m,
             max_freqs=max_freqs,
+            time_key_len=getattr(configs, 'retrieval_time_key_len', 96),
             temperature=temperature,
-            phase_weight=getattr(configs, 'phase_similarity_weight', 0.55),
-            amplitude_weight=getattr(configs, 'amplitude_similarity_weight', 0.25),
-            time_weight=getattr(configs, 'time_similarity_weight', 0.20),
+            retrieval_mode=getattr(configs, 'retrieval_mode', 'time_phase_rerank'),
+            phase_weight=getattr(configs, 'phase_similarity_weight', 0.20),
+            amplitude_weight=getattr(configs, 'amplitude_similarity_weight', 0.10),
+            time_weight=getattr(configs, 'time_similarity_weight', 1.00),
             max_bank_size=max_bank_size,
             exclusion_radius=exclusion_radius,
         )
+        self.phase_retrieval = self.retrieval_bank
         self.host_to_retrieval = nn.Sequential(
             nn.Linear(self.hidden_dim, self.hidden_dim),
             nn.GELU(),
@@ -168,11 +192,12 @@ class Model(nn.Module):
             nn.Dropout(self.mlp_dropout),
             nn.Linear(self.pred_len, self.pred_len),
         )
-        self.rfrl_controller = RetrievalPreferenceController(
+        self.rfrl_controller = RetrievalActionController(
             channels=self.channels,
             hidden_size=getattr(configs, 'rfrl_hidden_size', 64),
+            alpha_bins=_parse_alpha_bins(getattr(configs, 'rfrl_alpha_bins', '0,0.05,0.1,0.2,0.4')),
         )
-        self.adaptive_fusion = AdaptiveFusion(channels=self.channels)
+        self.adaptive_fusion = AdaptiveFusion()
 
         nn.init.zeros_(self.retrieval_adapter[-1].weight)
         nn.init.zeros_(self.retrieval_adapter[-1].bias)
@@ -181,8 +206,8 @@ class Model(nn.Module):
         if not self.use_phase_rpo_rfrl:
             return
         device = device or next(self.parameters()).device
-        print('Building Phase-RPO-RFRL retrieval bank from train split...')
-        self.phase_retrieval.build(train_data, device=device)
+        print('Building time-primary Phase-RPO-RFRL retrieval bank from train split...')
+        self.retrieval_bank.build(train_data, device=device)
 
     def host_forecast(self, x_enc, return_state=False):
         baseline, host_state, norm_stats = self.host(x_enc, return_state=True)
@@ -193,58 +218,100 @@ class Model(nn.Module):
     def forecast(self, x_enc):
         return self.host_forecast(x_enc)
 
+    def _comparison_tensors(self, target_y, baseline, retrieval_forecast,
+                            retrieval_correction, final):
+        target = target_y[:, -self.pred_len:, :]
+        if self.features == 'MS':
+            return (
+                target[:, :, -1:],
+                baseline[:, :, -1:],
+                retrieval_forecast[:, :, -1:],
+                retrieval_correction[:, :, -1:],
+                final[:, :, -1:],
+            )
+        return target, baseline, retrieval_forecast, retrieval_correction, final
+
     def forecast_with_retrieval(self, x_enc, batch_index=None, mode='train', target_y=None):
         baseline, host_state, norm_stats = self.host_forecast(x_enc, return_state=True)
         if not self.use_phase_rpo_rfrl:
             self.latest_aux_loss = None
+            self.latest_aux_details = {}
             self.latest_diagnostics = {'baseline': baseline.detach()}
             return baseline
 
-        phase_delta, retrieval_info = self.phase_retrieval.retrieve(
+        retrieved_delta, retrieval_info = self.retrieval_bank.retrieve(
             x_enc, batch_index=batch_index, mode=mode
         )
         stdev = norm_stats['stdev'].clamp_min(1e-5)
-        phase_delta_norm = phase_delta / stdev
+        retrieved_delta_norm = retrieved_delta / stdev
         host_guided_bias = self.host_to_retrieval(host_state)
-        retrieval_input = phase_delta_norm.permute(0, 2, 1) + host_guided_bias
+        retrieval_input = retrieved_delta_norm.permute(0, 2, 1) + host_guided_bias
         retrieval_correction_norm = self.retrieval_adapter(retrieval_input).permute(0, 2, 1)
         retrieval_correction = self.retrieval_residual_scale * retrieval_correction_norm * stdev
 
-        raw_retrieval_forecast = x_enc[:, -1:, :] + phase_delta
+        raw_retrieval_forecast = x_enc[:, -1:, :] + retrieved_delta
         retrieval_forecast = baseline + retrieval_correction
 
-        preference_score, guidance = self.rfrl_controller(x_enc, baseline, retrieval_forecast, retrieval_info)
-        retrieval_enhanced = baseline + preference_score * retrieval_correction
-        final, fusion_weight = self.adaptive_fusion(baseline, retrieval_enhanced, guidance)
+        preference_score, action_alpha, action_probabilities, action_logits = self.rfrl_controller(
+            x_enc, baseline, retrieval_forecast, retrieval_info
+        )
+        retrieval_enhanced = retrieval_forecast
+        final, fusion_weight = self.adaptive_fusion(baseline, retrieval_enhanced, action_alpha)
 
         self.latest_aux_loss = None
-        if self.training and target_y is not None:
-            target = target_y[:, -self.pred_len:, :]
-            if self.features == 'MS':
-                target = target[:, :, -1:]
-                baseline_cmp = baseline[:, :, -1:]
-                retrieval_cmp = retrieval_forecast[:, :, -1:]
-                final_cmp = final[:, :, -1:]
-            else:
-                baseline_cmp = baseline
-                retrieval_cmp = retrieval_forecast
-                final_cmp = final
+        self.latest_aux_details = {}
+        oracle_alpha = None
+        if target_y is not None:
+            target, baseline_cmp, retrieval_cmp, correction_cmp, final_cmp = self._comparison_tensors(
+                target_y, baseline, retrieval_forecast, retrieval_correction, final
+            )
 
-            baseline_err = F.mse_loss(baseline_cmp.detach(), target, reduction='none').mean(dim=(1, 2))
-            retrieval_err = F.mse_loss(retrieval_cmp.detach(), target, reduction='none').mean(dim=(1, 2))
-            final_err = F.mse_loss(final_cmp.detach(), target, reduction='none').mean(dim=(1, 2))
-            utility = torch.sigmoid((baseline_err - retrieval_err) / (baseline_err.detach().mean() + 1e-6))
-            preference_loss = F.binary_cross_entropy(
-                preference_score.view(-1).clamp(1e-5, 1.0 - 1e-5),
-                utility.detach(),
-            )
-            policy_target = torch.sigmoid((baseline_err - final_err) / (baseline_err.detach().mean() + 1e-6))
-            policy_loss = F.mse_loss(guidance.mean(dim=(1, 2)), policy_target.detach())
-            cost_loss = fusion_weight.mean()
-            self.latest_aux_loss = (
-                self.rpo_loss_weight * preference_loss
-                + self.rfrl_loss_weight * (policy_loss + self.retrieval_cost * cost_loss)
-            )
+            with torch.no_grad():
+                alpha_bins = self.rfrl_controller.alpha_bins.to(
+                    device=x_enc.device, dtype=baseline_cmp.dtype
+                )
+                alpha_candidates = (
+                    baseline_cmp.detach().unsqueeze(0)
+                    + alpha_bins.view(-1, 1, 1, 1) * correction_cmp.detach().unsqueeze(0)
+                )
+                alpha_err = ((alpha_candidates - target.detach().unsqueeze(0)) ** 2).mean(dim=(2, 3))
+                oracle_err, oracle_index = alpha_err.min(dim=0)
+                oracle_alpha = alpha_bins[oracle_index].view(-1, 1, 1)
+                baseline_err = F.mse_loss(
+                    baseline_cmp.detach(), target.detach(), reduction='none'
+                ).mean(dim=(1, 2))
+                retrieval_err = F.mse_loss(
+                    retrieval_cmp.detach(), target.detach(), reduction='none'
+                ).mean(dim=(1, 2))
+                final_err = F.mse_loss(
+                    final_cmp.detach(), target.detach(), reduction='none'
+                ).mean(dim=(1, 2))
+                scale = baseline_err.mean().clamp_min(1e-6)
+                oracle_utility = torch.sigmoid((baseline_err - oracle_err) / scale)
+
+            if self.training:
+                preference_loss = F.binary_cross_entropy(
+                    preference_score.view(-1).clamp(1e-5, 1.0 - 1e-5),
+                    oracle_utility.detach(),
+                )
+                policy_loss = F.cross_entropy(action_logits, oracle_index.detach())
+                adapter_target = target - baseline_cmp.detach()
+                adapter_loss = F.smooth_l1_loss(correction_cmp, adapter_target.detach())
+                cost_loss = action_alpha.mean()
+                self.latest_aux_loss = (
+                    self.rpo_loss_weight * preference_loss
+                    + self.rfrl_loss_weight * (policy_loss + self.retrieval_cost * cost_loss)
+                    + self.retrieval_adapter_loss_weight * adapter_loss
+                )
+                self.latest_aux_details = {
+                    'preference_loss': preference_loss.detach(),
+                    'policy_loss': policy_loss.detach(),
+                    'adapter_loss': adapter_loss.detach(),
+                    'retrieval_cost_loss': cost_loss.detach(),
+                    'baseline_err': baseline_err.mean().detach(),
+                    'retrieval_err': retrieval_err.mean().detach(),
+                    'final_err': final_err.mean().detach(),
+                }
 
         self.latest_diagnostics = {
             'baseline': baseline.detach(),
@@ -253,11 +320,20 @@ class Model(nn.Module):
             'retrieval_correction': retrieval_correction.detach(),
             'retrieval_enhanced': retrieval_enhanced.detach(),
             'preference_score': preference_score.detach(),
+            'action_alpha': action_alpha.detach(),
+            'action_probabilities': action_probabilities.detach(),
             'fusion_weight': fusion_weight.detach(),
             'top_similarity': retrieval_info['top_similarity'].detach(),
+            'primary_top_similarity': retrieval_info['primary_top_similarity'].detach(),
+            'time_similarity': retrieval_info['time_similarity'].detach(),
+            'phase_similarity': retrieval_info['phase_similarity'].detach(),
+            'amplitude_similarity': retrieval_info['amplitude_similarity'].detach(),
             'top_indices': retrieval_info['top_indices'],
+            'primary_top_indices': retrieval_info['primary_top_indices'],
             'host_state_norm': host_state.detach().norm(dim=-1).mean(dim=-1),
         }
+        if oracle_alpha is not None:
+            self.latest_diagnostics['oracle_alpha'] = oracle_alpha.detach()
         return final
 
     def forward(self, x_enc, x_mark_enc, x_dec, x_mark_dec, mask=None,

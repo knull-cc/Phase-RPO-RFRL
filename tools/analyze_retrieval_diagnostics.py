@@ -25,9 +25,15 @@ def summarize(name, values):
 def maybe_corr(name, left, right):
     left = np.asarray(left)
     right = np.asarray(right)
-    if left.std() > 1e-12 and right.std() > 1e-12:
+    mask = np.isfinite(left) & np.isfinite(right)
+    if mask.sum() < 3:
+        return
+    left = left[mask]
+    right = right[mask]
+    if left.std() > 1e-6 and right.std() > 1e-6:
         corr = np.corrcoef(left, right)[0, 1]
-        print(f"{name}: {corr:.6f}")
+        if np.isfinite(corr):
+            print(f"{name}: {corr:.6f}")
 
 
 def load_required(path, filename):
@@ -38,16 +44,30 @@ def load_required(path, filename):
 
 
 def align_like_prediction(array, pred):
-    if array.ndim == pred.ndim + 1 and array.shape[2:] == pred.shape[1:]:
-        return array
     if array.shape == pred.shape:
         return array
     raise ValueError(f"unexpected diagnostic shape {array.shape}; prediction shape is {pred.shape}")
 
 
+def sample_mean(array):
+    array = np.asarray(array)
+    return array.reshape(array.shape[0], -1).mean(axis=1)
+
+
+def maybe_get_prediction(diag, name, pred):
+    if name not in diag:
+        return None
+    return align_like_prediction(diag[name], pred)
+
+
+def print_gain_rate(name, gain):
+    print(f"{name} better than baseline: {(gain > 0).mean():.2%}")
+    print(f"harmful {name} rate: {(gain < 0).mean():.2%}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Analyze Phase-RPO-RFRL retrieval diagnostics.")
-    parser.add_argument("result_dir", help="A directory under results/ that contains pred.npy, true.npy and retrieval_diagnostics.npz")
+    parser.add_argument("result_dir", help="A results/ directory with pred.npy, true.npy and retrieval_diagnostics.npz")
     args = parser.parse_args()
 
     result_dir = args.result_dir.rstrip("/")
@@ -68,106 +88,132 @@ def main():
         print("Rerun after the latest code change to get segment-level diagnostics.")
         return
 
-    baseline = align_like_prediction(diag["baseline"], pred)
-    adapter_retrieval = align_like_prediction(diag["retrieval_forecast"], pred)
-    retrieval_enhanced = align_like_prediction(diag["retrieval_enhanced"], pred)
-    raw_phase_retrieval = None
-    if "raw_retrieval_forecast" in diag:
-        raw_phase_retrieval = align_like_prediction(diag["raw_retrieval_forecast"], pred)
+    baseline = maybe_get_prediction(diag, "baseline", pred)
+    raw_retrieval = maybe_get_prediction(diag, "raw_retrieval_forecast", pred)
+    adapter_retrieval = maybe_get_prediction(diag, "retrieval_forecast", pred)
+    enhanced_retrieval = maybe_get_prediction(diag, "retrieval_enhanced", pred)
 
     baseline_mse = mse(baseline, true)
     adapter_mse = mse(adapter_retrieval, true)
-    enhanced_mse = mse(retrieval_enhanced, true)
-    raw_phase_mse = None
-    if raw_phase_retrieval is not None:
-        raw_phase_mse = mse(raw_phase_retrieval, true)
+    enhanced_mse = mse(enhanced_retrieval, true) if enhanced_retrieval is not None else None
+    raw_mse = mse(raw_retrieval, true) if raw_retrieval is not None else None
+
+    oracle_mse = None
+    if "oracle_alpha" in diag and "retrieval_correction" in diag:
+        oracle_alpha = diag["oracle_alpha"]
+        correction = align_like_prediction(diag["retrieval_correction"], pred)
+        oracle_forecast = baseline + oracle_alpha * correction
+        oracle_mse = mse(oracle_forecast, true)
 
     print()
     print(summarize("baseline_mse", baseline_mse))
-    if raw_phase_mse is not None:
-        print(summarize("phase_raw_retrieval_mse", raw_phase_mse))
-    else:
-        print("phase_raw_retrieval_mse: unavailable (missing raw_retrieval_forecast)")
+    if raw_mse is not None:
+        print(summarize("raw_retrieval_mse", raw_mse))
     print(summarize("adapter_retrieval_mse", adapter_mse))
-    print(summarize("retrieval_enhanced_mse", enhanced_mse))
+    if enhanced_mse is not None:
+        print(summarize("retrieval_enhanced_mse", enhanced_mse))
+    if oracle_mse is not None:
+        print(summarize("oracle_alpha_mse", oracle_mse))
 
     final_gain = baseline_mse - final_mse
     adapter_gain = baseline_mse - adapter_mse
-    enhanced_gain = baseline_mse - enhanced_mse
-    raw_phase_gain = None
-    if raw_phase_mse is not None:
-        raw_phase_gain = baseline_mse - raw_phase_mse
+    enhanced_gain = baseline_mse - enhanced_mse if enhanced_mse is not None else None
+    raw_gain = baseline_mse - raw_mse if raw_mse is not None else None
+    oracle_gain = baseline_mse - oracle_mse if oracle_mse is not None else None
 
     print()
     print(summarize("final_gain_vs_baseline", final_gain))
-    if raw_phase_gain is not None:
-        print(summarize("phase_raw_gain_vs_baseline", raw_phase_gain))
+    if raw_gain is not None:
+        print(summarize("raw_retrieval_gain_vs_baseline", raw_gain))
     print(summarize("adapter_gain_vs_baseline", adapter_gain))
-    print(summarize("enhanced_gain_vs_baseline", enhanced_gain))
+    if enhanced_gain is not None:
+        print(summarize("enhanced_gain_vs_baseline", enhanced_gain))
+    if oracle_gain is not None:
+        print(summarize("oracle_alpha_gain_vs_baseline", oracle_gain))
 
     print()
-    print(f"final better than baseline: {(final_gain > 0).mean():.2%}")
-    if raw_phase_gain is not None:
-        print(f"phase raw retrieval better than baseline: {(raw_phase_gain > 0).mean():.2%}")
-    print(f"adapter retrieval better than baseline: {(adapter_gain > 0).mean():.2%}")
-    print(f"retrieval enhanced better than baseline: {(enhanced_gain > 0).mean():.2%}")
-    if raw_phase_gain is not None:
-        print(f"harmful phase raw retrieval rate: {(raw_phase_gain < 0).mean():.2%}")
-    print(f"harmful adapter retrieval rate: {(adapter_gain < 0).mean():.2%}")
+    print_gain_rate("final", final_gain)
+    if raw_gain is not None:
+        print_gain_rate("raw retrieval", raw_gain)
+    print_gain_rate("adapter retrieval", adapter_gain)
+    if oracle_gain is not None:
+        print_gain_rate("oracle alpha", oracle_gain)
 
-    if "fusion_weight" in diag:
-        fusion_weight = diag["fusion_weight"]
+    if "action_alpha" in diag:
+        action_alpha = sample_mean(diag["action_alpha"])
         print()
-        print(summarize("fusion_weight", fusion_weight.reshape(fusion_weight.shape[0], -1).mean(axis=1)))
-        adapter_harmful = adapter_gain < 0
-        adapter_helpful = adapter_gain > 0
-        if adapter_harmful.any():
-            print(f"mean fusion weight on harmful adapter retrieval: {fusion_weight[adapter_harmful].mean():.6f}")
-        if adapter_helpful.any():
-            print(f"mean fusion weight on helpful adapter retrieval: {fusion_weight[adapter_helpful].mean():.6f}")
-        if raw_phase_gain is not None:
-            raw_harmful = raw_phase_gain < 0
-            raw_helpful = raw_phase_gain > 0
-            if raw_harmful.any():
-                print(f"mean fusion weight on harmful phase raw retrieval: {fusion_weight[raw_harmful].mean():.6f}")
-            if raw_helpful.any():
-                print(f"mean fusion weight on helpful phase raw retrieval: {fusion_weight[raw_helpful].mean():.6f}")
+        print(summarize("action_alpha", action_alpha))
+        if "oracle_alpha" in diag:
+            oracle_alpha_mean = sample_mean(diag["oracle_alpha"])
+            print(summarize("oracle_alpha", oracle_alpha_mean))
+            print(summarize("abs_action_alpha_error", np.abs(action_alpha - oracle_alpha_mean)))
+            print(f"model retrieval-use rate: {(action_alpha > 1e-6).mean():.2%}")
+            print(f"oracle retrieval-use rate: {(oracle_alpha_mean > 1e-6).mean():.2%}")
+            maybe_corr("corr(action_alpha, oracle_alpha)", action_alpha, oracle_alpha_mean)
+        maybe_corr("corr(action_alpha, final_gain)", action_alpha, final_gain)
+        maybe_corr("corr(action_alpha, adapter_gain)", action_alpha, adapter_gain)
+        if raw_gain is not None:
+            maybe_corr("corr(action_alpha, raw_retrieval_gain)", action_alpha, raw_gain)
+
+    if "action_probabilities" in diag:
+        probs = diag["action_probabilities"]
+        entropy = -(probs * np.log(probs + 1e-8)).sum(axis=1)
+        print(summarize("action_probability_entropy", entropy))
+
+    if "fusion_weight" in diag and "action_alpha" not in diag:
+        fusion_weight = sample_mean(diag["fusion_weight"])
+        print()
+        print(summarize("fusion_weight", fusion_weight))
 
     if "preference_score" in diag:
-        preference = diag["preference_score"].reshape(diag["preference_score"].shape[0], -1).mean(axis=1)
+        preference = sample_mean(diag["preference_score"])
         print()
-        print(summarize("preference_score", preference))
-        if raw_phase_gain is not None:
-            maybe_corr("corr(preference_score, phase_raw_gain)", preference, raw_phase_gain)
-        maybe_corr("corr(preference_score, adapter_gain)", preference, adapter_gain)
+        print(summarize("rpo_preference_score", preference))
+        maybe_corr("corr(rpo_preference_score, final_gain)", preference, final_gain)
+        maybe_corr("corr(rpo_preference_score, adapter_gain)", preference, adapter_gain)
+        if raw_gain is not None:
+            maybe_corr("corr(rpo_preference_score, raw_retrieval_gain)", preference, raw_gain)
+        if "oracle_alpha" in diag:
+            maybe_corr("corr(rpo_preference_score, oracle_alpha)", preference, sample_mean(diag["oracle_alpha"]))
 
-    if "top_similarity" in diag:
-        top_sim = diag["top_similarity"]
-        sim_mean = top_sim.reshape(top_sim.shape[0], -1).mean(axis=1)
-        print()
-        print(summarize("top_similarity", sim_mean))
-        if raw_phase_gain is not None:
-            maybe_corr("corr(top_similarity, phase_raw_gain)", sim_mean, raw_phase_gain)
-        maybe_corr("corr(top_similarity, adapter_gain)", sim_mean, adapter_gain)
+    for key in [
+        "primary_top_similarity",
+        "top_similarity",
+        "time_similarity",
+        "phase_similarity",
+        "amplitude_similarity",
+    ]:
+        if key in diag:
+            value = sample_mean(diag[key])
+            print()
+            print(summarize(key, value))
+            maybe_corr(f"corr({key}, adapter_gain)", value, adapter_gain)
+            if raw_gain is not None:
+                maybe_corr(f"corr({key}, raw_retrieval_gain)", value, raw_gain)
 
     print()
-    if raw_phase_gain is not None and raw_phase_gain.mean() <= 0:
-        print("Likely bottleneck: phase-aware retrieval quality. Raw phase candidates are not better than the host baseline on average.")
-    elif adapter_gain.mean() <= 0:
-        print("Likely bottleneck: retrieval adapter. Raw phase retrieval may have signal, but the learned correction degrades it.")
-    elif enhanced_gain.mean() <= 0:
-        print("Likely bottleneck: RPO/preference scaling. Adapter retrieval has signal, but preference-enhanced retrieval degrades it.")
+    if raw_gain is not None and raw_gain.mean() <= 0 and (
+        oracle_gain is None or oracle_gain.mean() <= 0
+    ):
+        print("Likely bottleneck: retrieval quality. Time-primary candidates still do not beat the host baseline on average.")
+    elif adapter_gain.mean() <= 0 and (
+        oracle_gain is None or oracle_gain.mean() <= 0
+    ):
+        print("Likely bottleneck: retrieval adapter. Candidate residuals may exist, but the learned correction is not useful.")
+    elif oracle_gain is not None and oracle_gain.mean() > 0 and final_gain.mean() <= 0:
+        print("Likely bottleneck: RFRL action policy. Oracle alpha can help, but learned action_alpha is not using it well.")
+    elif adapter_gain.mean() > 0 and final_gain.mean() <= 0:
+        print("Likely bottleneck: adaptive fusion/action scaling. Adapter correction has signal, but final control degrades it.")
     elif final_gain.mean() <= 0:
-        print("Likely bottleneck: RFRL/adaptive fusion. Retrieval branch has signal, but the final controller uses it poorly.")
+        print("Likely bottleneck: final retrieval-control coupling. Inspect action_alpha and preference correlations.")
     else:
         print("No obvious segment failure: final forecast improves over baseline on average. Inspect slice-level failures next.")
 
-    if raw_phase_gain is not None:
-        print("\nInterpretation guide:")
-        print("- phase_raw_gain_vs_baseline <= 0: phase retrieval candidates/residuals are not useful yet.")
-        print("- phase_raw_gain_vs_baseline > 0 and adapter_gain_vs_baseline <= 0: adapter corrupts useful retrieval signal.")
-        print("- adapter_gain_vs_baseline > 0 and enhanced_gain_vs_baseline <= 0: RPO/preference scaling is the bottleneck.")
-        print("- enhanced_gain_vs_baseline > 0 and final_gain_vs_baseline <= 0: RFRL/adaptive fusion is the bottleneck.")
+    print("\nInterpretation guide:")
+    print("- raw_retrieval_gain_vs_baseline <= 0: retrieved historical residuals are weak as full forecasts.")
+    print("- adapter_gain_vs_baseline <= 0: adapter/correction is not yet producing useful residuals.")
+    print("- oracle_alpha_gain_vs_baseline > 0 and final_gain_vs_baseline <= 0: RFRL action learning is the bottleneck.")
+    print("- low corr(action_alpha, oracle_alpha): controller is not learning when/how strongly to use retrieval.")
 
 
 if __name__ == "__main__":

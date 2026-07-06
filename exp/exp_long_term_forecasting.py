@@ -229,9 +229,17 @@ class Exp_Long_Term_Forecast(Exp_Basic):
             'retrieval_correction': [],
             'retrieval_enhanced': [],
             'preference_score': [],
+            'action_alpha': [],
+            'action_probabilities': [],
+            'oracle_alpha': [],
             'fusion_weight': [],
             'top_similarity': [],
+            'primary_top_similarity': [],
+            'time_similarity': [],
+            'phase_similarity': [],
+            'amplitude_similarity': [],
             'top_indices': [],
+            'primary_top_indices': [],
         }
         folder_path = './test_results/' + setting + '/'
         if not os.path.exists(folder_path):
@@ -254,10 +262,12 @@ class Exp_Long_Term_Forecast(Exp_Basic):
                 if self.args.use_amp:
                     with torch.cuda.amp.autocast():
                         outputs = self._model_forward(batch_x, batch_x_mark, dec_inp, batch_y_mark,
-                                                      batch_index=batch_index, mode='test')
+                                                      batch_index=batch_index, mode='test',
+                                                      target_y=batch_y)
                 else:
                     outputs = self._model_forward(batch_x, batch_x_mark, dec_inp, batch_y_mark,
-                                                  batch_index=batch_index, mode='test')
+                                                  batch_index=batch_index, mode='test',
+                                                  target_y=batch_y)
 
                 latest_diagnostics = self._get_diagnostics()
                 for key in diagnostics:
